@@ -71,6 +71,31 @@ def _merge_captured_states(
     return {"residual_stream": merged}
 
 
+def _decode_intrinsic_metrics(states: list[bytes | None] | None) -> dict[str, Any] | None:
+    """Decode the first metrics payload returned by a worker."""
+    if not states:
+        return None
+    for state in states:
+        if state is None:
+            continue
+        return pickle.loads(
+            _ZSTD_DECOMPRESSOR.decompress(state)
+            if state[:4] == _ZSTD_MAGIC
+            else state
+        )
+    return None
+
+
+def _metric_options_for_output(
+    params_list: Sequence[SamplingParams], output_idx: int
+) -> Any | None:
+    """Return metric options for an output in sync generation."""
+    if not params_list:
+        return None
+    params = params_list[output_idx] if len(params_list) > 1 else params_list[0]
+    return (params.extra_args or {}).get("output_intrinsic_metrics")
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
@@ -156,6 +181,8 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
+    metric_options = extra.get("output_intrinsic_metrics")
+    wants_metrics = metric_options is not None
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     steering_vectors = extra.pop("apply_steering_vectors", None)
@@ -169,7 +196,7 @@ async def _patched_generate(
     # Allow explicit prefix-cache bypass via extra_args.
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
 
-    needs_hooks = wants_activations or steering_vectors is not None
+    needs_hooks = wants_activations or wants_metrics or steering_vectors is not None
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
@@ -190,21 +217,33 @@ async def _patched_generate(
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
-            if output.finished and wants_activations:
-                states = await self.collective_rpc(
-                    "get_captured_states", args=(request_id,)
+            if output.finished and (wants_metrics or wants_activations):
+                full_token_ids = list(output.prompt_token_ids) + list(
+                    output.outputs[0].token_ids
                 )
-                activations = _merge_captured_states(states)
-                if activations is not None:
-                    n_prompt = len(output.prompt_token_ids)
-                    n_gen = len(output.outputs[0].token_ids)
-                    _trim_activations(activations, n_prompt + n_gen - 1)
-                    output.activations = activations
+                n_prompt = len(output.prompt_token_ids)
+                if wants_metrics:
+                    states = await self.collective_rpc(
+                        "get_intrinsic_metrics",
+                        args=(request_id, full_token_ids, n_prompt, metric_options),
+                    )
+                    metrics = _decode_intrinsic_metrics(states)
+                    if metrics is not None:
+                        output.intrinsic_metrics = metrics
+                if wants_activations:
+                    states = await self.collective_rpc(
+                        "get_captured_states", args=(request_id,)
+                    )
+                    activations = _merge_captured_states(states)
+                    if activations is not None:
+                        n_gen = len(output.outputs[0].token_ids)
+                        _trim_activations(activations, n_prompt + n_gen - 1)
+                        output.activations = activations
             yield output
     finally:
         if steering_vectors is not None:
             await self.collective_rpc("clear_steering_data", args=(request_id,))
-        if wants_activations:
+        if wants_activations or wants_metrics:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
 
 
@@ -237,6 +276,10 @@ def _patched_llm_generate(
         (sp.extra_args or {}).get("output_residual_stream") is not None
         for sp in params_list
     )
+    wants_metrics = any(
+        (sp.extra_args or {}).get("output_intrinsic_metrics") is not None
+        for sp in params_list
+    )
 
     # Extract steering vectors per-request.  We must pop them from
     # extra_args before vLLM serialises SamplingParams (tensors don't
@@ -259,7 +302,7 @@ def _patched_llm_generate(
             any_skip_kv_cache = True
 
     has_steering = len(steering_payloads) > 0
-    needs_hooks = wants_activations or has_steering
+    needs_hooks = wants_activations or wants_metrics or has_steering
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
@@ -275,16 +318,31 @@ def _patched_llm_generate(
     assert _original_llm_generate is not None
     outputs = _original_llm_generate(self, prompts, sampling_params, **kwargs)
 
-    if wants_activations:
-        for output in outputs:
+    if wants_metrics or wants_activations:
+        for output_idx, output in enumerate(outputs):
             req_id = output.request_id
-            states = self.collective_rpc("get_captured_states", args=(req_id,))
-            activations = _merge_captured_states(states)
-            if activations is not None:
-                n_prompt = len(output.prompt_token_ids)
-                n_gen = len(output.outputs[0].token_ids)
-                _trim_activations(activations, n_prompt + n_gen - 1)
-                output.activations = activations
+            n_prompt = len(output.prompt_token_ids)
+            n_gen = len(output.outputs[0].token_ids)
+            full_token_ids = list(output.prompt_token_ids) + list(
+                output.outputs[0].token_ids
+            )
+            if wants_metrics:
+                metric_options = _metric_options_for_output(params_list, output_idx)
+                states = self.collective_rpc(
+                    "get_intrinsic_metrics",
+                    args=(req_id, full_token_ids, n_prompt, metric_options),
+                )
+                metrics = _decode_intrinsic_metrics(states)
+                if metrics is not None:
+                    output.intrinsic_metrics = metrics
+            if wants_activations:
+                states = self.collective_rpc("get_captured_states", args=(req_id,))
+                activations = _merge_captured_states(states)
+                if activations is not None:
+                    _trim_activations(activations, n_prompt + n_gen - 1)
+                    output.activations = activations
+            if wants_metrics and not wants_activations:
+                self.collective_rpc("clear_captured_states", args=(req_id,))
 
     # Clean up steering data.
     for sid in steering_payloads:
@@ -299,13 +357,17 @@ def _patched_llm_generate(
 
 
 def _patched_completion_response(self, final_res_batch, *args, **kwargs):
-    """Wrap the completion response builder to inject serialized activations."""
+    """Wrap the completion response builder to inject vllm-lens outputs."""
     assert _original_completion_response is not None
     response = _original_completion_response(self, final_res_batch, *args, **kwargs)
     for res in final_res_batch or ():
         activations = getattr(res, "activations", None)
         if activations is not None:
             response.activations = serialize_activations(activations)
+        metrics = getattr(res, "intrinsic_metrics", None)
+        if metrics is not None:
+            response.intrinsic_metrics = metrics
+        if activations is not None or metrics is not None:
             break
     return response
 
@@ -339,6 +401,9 @@ async def _patched_chat_full_generator(
         activations = getattr(last_output, "activations", None)
         if activations is not None:
             response.activations = serialize_activations(activations)
+        metrics = getattr(last_output, "intrinsic_metrics", None)
+        if metrics is not None:
+            response.intrinsic_metrics = metrics
 
     return response
 
@@ -358,7 +423,9 @@ def register() -> None:
     activations are included in HTTP responses from ``vllm serve``.
 
     Use ``extra_args={"output_residual_stream": True | list[int]}`` in
-    SamplingParams to request activations.
+    SamplingParams to request activations. Use
+    ``extra_args={"output_intrinsic_metrics": True}`` to request metrics
+    computed from all residual-stream layers.
     """
     global _original_create_engine_config
     global _original_generate, _original_llm_generate

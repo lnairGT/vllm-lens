@@ -7,6 +7,10 @@ from vllm_lens._helpers._serialize import (
     serialize_tensor,
 )
 from vllm_lens._helpers.types import SteeringVector
+from vllm_lens.metrics import (
+    compute_intrinsic_metrics_from_activations,
+    normalize_metric_options,
+)
 
 try:
     __version__ = version("vllm-lens")
@@ -19,5 +23,7 @@ __all__ = [
     "serialize_activations",
     "serialize_tensor",
     "SteeringVector",
+    "compute_intrinsic_metrics_from_activations",
+    "normalize_metric_options",
     "__version__",
 ]
