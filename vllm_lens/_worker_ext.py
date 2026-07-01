@@ -15,13 +15,17 @@ from __future__ import annotations
 import logging
 import pickle
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_lens.metrics import (
+    compute_intrinsic_metrics_from_activations,
+    normalize_metric_options,
+)
 from vllm_lens._helpers.types import SteeringVector
 
 if TYPE_CHECKING:
@@ -53,6 +57,46 @@ def _get_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
         "Expected model.language_model.model.layers, "
         "model.model.decoder.layers, or model.model.layers"
     )
+
+
+def _get_logits_fn(model: torch.nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Find the model's hidden-state-to-logits function."""
+    compute_logits = getattr(model, "compute_logits", None)
+    if callable(compute_logits):
+
+        def _compute(hidden_states: torch.Tensor) -> torch.Tensor:
+            logits = compute_logits(hidden_states)
+            if logits is None:
+                raise ValueError("Model compute_logits returned None")
+            return cast(torch.Tensor, logits)
+
+        return _compute
+
+    raise AttributeError(f"Cannot find compute_logits on {type(model).__name__}")
+
+
+def _get_final_logits_fn(model: torch.nn.Module) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Find a logits function that applies the model's final norm first."""
+    logits_fn = _get_logits_fn(model)
+    m: Any = model
+    final_norm = None
+    if hasattr(m, "model") and hasattr(m.model, "norm"):
+        final_norm = m.model.norm
+    elif hasattr(m, "language_model") and hasattr(m.language_model, "model"):
+        inner = m.language_model.model
+        if hasattr(inner, "norm"):
+            final_norm = inner.norm
+
+    if final_norm is None:
+        return logits_fn
+
+    def _compute(hidden_states: torch.Tensor) -> torch.Tensor:
+        normalized = final_norm(hidden_states)
+        if isinstance(normalized, tuple):
+            normalized = normalized[0]
+        return logits_fn(cast(torch.Tensor, normalized))
+
+    return _compute
 
 
 def _find_steering_configs(
@@ -255,10 +299,12 @@ def _hook_inner(
                 continue
 
             output_residual_stream = extra.get("output_residual_stream")
-            if output_residual_stream is None:
+            output_intrinsic_metrics = extra.get("output_intrinsic_metrics")
+            if output_residual_stream is None and output_intrinsic_metrics is None:
                 continue
             if (
-                isinstance(output_residual_stream, list)
+                output_intrinsic_metrics is None
+                and isinstance(output_residual_stream, list)
                 and layer_idx not in output_residual_stream
             ):
                 continue
@@ -464,6 +510,58 @@ class HiddenStatesExtension:
                         }
                     )
                 )
+        return None
+
+    def get_intrinsic_metrics(
+        self,
+        external_req_id: str,
+        full_token_ids: list[int],
+        prompt_len: int,
+        options: dict[str, Any] | bool | None = None,
+    ) -> bytes | None:
+        """Compute intrinsic metrics for a captured request.
+
+        Metrics require a complete residual stream and the model LM head,
+        so this is computed on the worker before activations are serialized
+        back to the driver.
+        """
+        prefix = f"{external_req_id}-"
+        for req_id, layer_dict in self._captured_states.items():
+            if not req_id.startswith(prefix):
+                continue
+
+            sorted_indices = sorted(layer_dict.keys())
+            if not sorted_indices:
+                return None
+
+            total_layers = len(_get_layers(self.model_runner.model))
+            if sorted_indices != list(range(total_layers)):
+                logger.warning(
+                    "Intrinsic metrics require all decoder layers; got %s of %d",
+                    sorted_indices,
+                    total_layers,
+                )
+                return None
+
+            per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [  # type: ignore[reportUndefinedVariable]
+                torch.cat(layer_dict[idx], dim=0) for idx in sorted_indices
+            ]
+            residual_stream: Float[torch.Tensor, "n_layers total_pos hidden_dim"] = (  # type: ignore[reportUndefinedVariable]
+                torch.stack(per_layer, dim=0)
+            )
+
+            metric_options = normalize_metric_options(options)
+            metrics = compute_intrinsic_metrics_from_activations(
+                residual_stream,
+                _get_logits_fn(self.model_runner.model),
+                full_token_ids,
+                prompt_len,
+                logits_device=next(self.model_runner.model.parameters()).device,
+                final_logits_fn=_get_final_logits_fn(self.model_runner.model),
+                **metric_options,
+            )
+            return _ZSTD_COMPRESSOR.compress(pickle.dumps(metrics))
+
         return None
 
     def _debug_captured_states_count(self) -> int:

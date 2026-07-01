@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 _pending_activations: ContextVar[dict[str, Any] | None] = ContextVar(
     "_pending_activations", default=None
 )
+_pending_intrinsic_metrics: ContextVar[dict[str, Any] | None] = ContextVar(
+    "_pending_intrinsic_metrics", default=None
+)
 _pending_token_ids: ContextVar[dict[str, list[int]] | None] = ContextVar(
     "_pending_token_ids", default=None
 )
@@ -86,6 +89,7 @@ class VLLMLensAPI(VLLMAPI):
         / ``"token_ids"`` (returned by vLLM when ``return_token_ids`` is set).
         """
         _pending_activations.set(response.get("activations"))
+        _pending_intrinsic_metrics.set(response.get("intrinsic_metrics"))
 
         token_id_data: dict[str, list[int]] = {}
         prompt_token_ids = response.get("prompt_token_ids")
@@ -117,6 +121,7 @@ class VLLMLensAPI(VLLMAPI):
             config.extra_body["return_token_ids"] = True  # type: ignore
 
         token_act = _pending_activations.set(None)
+        token_metrics = _pending_intrinsic_metrics.set(None)
         token_tid = _pending_token_ids.set(None)
         try:
             result = await super().generate(input, tools, tool_choice, config)
@@ -128,6 +133,10 @@ class VLLMLensAPI(VLLMAPI):
                 metadata["activations"] = {
                     name: deserialize_tensor(encoded) for name, encoded in raw.items()
                 }
+
+            metrics = _pending_intrinsic_metrics.get()
+            if metrics is not None:
+                metadata["intrinsic_metrics"] = metrics
 
             tid = _pending_token_ids.get()
             if tid is not None:
@@ -146,6 +155,7 @@ class VLLMLensAPI(VLLMAPI):
             return result
         finally:
             _pending_activations.reset(token_act)
+            _pending_intrinsic_metrics.reset(token_metrics)
             _pending_token_ids.reset(token_tid)
 
     @staticmethod
@@ -214,6 +224,7 @@ class VLLMLensAPI(VLLMAPI):
         resp = call.response
         if isinstance(resp, dict):
             resp.pop("activations", None)
+            resp.pop("intrinsic_metrics", None)
             resp.pop("prompt_token_ids", None)
             for choice in resp.get("choices") or []:  # type: ignore
                 if isinstance(choice, dict):
