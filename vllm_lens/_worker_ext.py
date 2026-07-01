@@ -99,6 +99,93 @@ def _get_final_logits_fn(model: torch.nn.Module) -> Callable[[torch.Tensor], tor
     return _compute
 
 
+def _iter_attention_metadata(attn_metadata: Any) -> list[Any]:
+    """Return concrete attention metadata objects from vLLM's wrappers."""
+    if attn_metadata is None:
+        return []
+    if isinstance(attn_metadata, list):
+        entries: list[Any] = []
+        for item in attn_metadata:
+            entries.extend(_iter_attention_metadata(item))
+        return entries
+    if isinstance(attn_metadata, dict):
+        return list(attn_metadata.values())
+    return [attn_metadata]
+
+
+def _select_attention_metadata(attn_metadata: Any) -> Any | None:
+    """Find the metadata object that owns query_start_loc."""
+    for meta in _iter_attention_metadata(attn_metadata):
+        if hasattr(meta, "query_start_loc"):
+            return meta
+    return None
+
+
+def _request_prompt_len(runner: Any, req_state: Any, batch_idx: int) -> int | None:
+    """Best-effort prompt length lookup across vLLM versions."""
+    for attr in ("num_prompt_tokens", "prompt_len"):
+        value = getattr(req_state, attr, None)
+        if value is not None:
+            return int(value.item() if isinstance(value, torch.Tensor) else value)
+
+    prompt_token_ids = getattr(req_state, "prompt_token_ids", None)
+    if prompt_token_ids is not None:
+        return len(prompt_token_ids)
+
+    inputs = getattr(req_state, "inputs", None)
+    prompt_token_ids = getattr(inputs, "prompt_token_ids", None)
+    if prompt_token_ids is not None:
+        return len(prompt_token_ids)
+
+    input_batch = getattr(runner, "input_batch", None)
+    num_prompt_tokens = getattr(input_batch, "num_prompt_tokens", None)
+    if num_prompt_tokens is None:
+        return None
+    if isinstance(num_prompt_tokens, torch.Tensor):
+        if num_prompt_tokens.dim() == 0:
+            return int(num_prompt_tokens.item())
+        return int(num_prompt_tokens[batch_idx].item())
+    if isinstance(num_prompt_tokens, (list, tuple)):
+        return int(num_prompt_tokens[batch_idx])
+    return int(num_prompt_tokens)
+
+
+def _sequence_start(meta: Any, req_state: Any, batch_idx: int, n_query: int) -> int:
+    """Absolute position for the first token in a request's current slice."""
+    seq_lens: Any = getattr(meta, "seq_lens", None)
+    if seq_lens is not None:
+        sl = seq_lens[batch_idx]
+        sl_val = sl.item() if isinstance(sl, torch.Tensor) else int(sl)
+        return int(sl_val - n_query)
+
+    for attr in ("num_computed_tokens", "num_tokens"):
+        value = getattr(req_state, attr, None)
+        if value is not None:
+            val = value.item() if isinstance(value, torch.Tensor) else int(value)
+            return int(val - n_query)
+
+    return 0
+
+
+def _metric_relative_indices(
+    abs_start: int,
+    n_query: int,
+    prompt_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Token indices in the current slice needed for intrinsic metrics.
+
+    The final prompt position scores the first generated token. Decode
+    positions score later generated tokens. Earlier prompt positions are
+    irrelevant for response-only metrics.
+    """
+    first_metric_pos = max(prompt_len - 1, 0)
+    rel_start = max(first_metric_pos - abs_start, 0)
+    if rel_start >= n_query:
+        return torch.empty(0, dtype=torch.long, device=device)
+    return torch.arange(rel_start, n_query, dtype=torch.long, device=device)
+
+
 def _find_steering_configs(
     extension: HiddenStatesExtension,
     internal_req_id: str,
@@ -208,27 +295,17 @@ def _hook_inner(
 
     ctx = get_forward_context()
     attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
-    # attention metadata entries — some (like GDNAttentionMetadata) lack
-    # query_start_loc.  Find one that has it.
-    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
-    if query_start_loc is None:
+    selected_attn_metadata = _select_attention_metadata(attn_metadata)
+    if selected_attn_metadata is None:
         logger.warning(
             "No attention metadata with query_start_loc found "
-            "(keys: %s). Skipping hook for this step.",
-            list(attn_metadata.keys()),
+            "(metadata type: %s). Skipping hook for this step.",
+            type(attn_metadata).__name__,
         )
         return None
+    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] = getattr(  # type: ignore[reportUndefinedVariable]
+        selected_attn_metadata, "query_start_loc"
+    )
 
     # --- Phase 1: detect steering requests --------------------------
     per_req_steering: list[list[SteeringVector]] = []
@@ -256,23 +333,16 @@ def _hook_inner(
             modified_output = output.clone()
             target = modified_output
 
-        # Retrieve seq_lens for absolute position calculation.
-        # seq_lens may be a tensor or a list depending on vLLM version.
-        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
-
         for i in range(num_reqs):
             if not per_req_steering[i]:
                 continue
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
             n_query = end - start
-            # Absolute position of the first token in this forward pass
-            if seq_lens is not None:
-                sl = seq_lens[i]
-                sl_val = sl.item() if isinstance(sl, torch.Tensor) else int(sl)
-                abs_start = int(sl_val - n_query)
-            else:
-                abs_start = 0  # fallback: treat as prefill from position 0
+            req_state = runner.requests.get(req_ids[i])
+            abs_start = _sequence_start(
+                selected_attn_metadata, req_state, i, n_query
+            )
             _apply_steering(
                 per_req_steering[i], layer_idx, target, start, end, abs_start
             )
@@ -302,26 +372,58 @@ def _hook_inner(
             output_intrinsic_metrics = extra.get("output_intrinsic_metrics")
             if output_residual_stream is None and output_intrinsic_metrics is None:
                 continue
-            if (
-                output_intrinsic_metrics is None
-                and isinstance(output_residual_stream, list)
+
+            start = int(query_start_loc[i].item())
+            end = int(query_start_loc[i + 1].item())
+            n_query = end - start
+
+            wants_activation_layer = output_residual_stream is not None and not (
+                isinstance(output_residual_stream, list)
                 and layer_idx not in output_residual_stream
-            ):
-                continue
+            )
+            if wants_activation_layer:
+                # Blocking .cpu() benchmarked faster than non_blocking + event sync
+                activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
+                    start:end
+                ].cpu()
 
-            start = query_start_loc[i].item()
-            end = query_start_loc[i + 1].item()
-            # Blocking .cpu() benchmarked faster than non_blocking + event sync
-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
-                start:end
-            ].cpu()
+                if req_id not in extension._captured_states:
+                    extension._captured_states[req_id] = {}
+                layer_states = extension._captured_states[req_id]
+                if layer_idx not in layer_states:
+                    layer_states[layer_idx] = []
+                layer_states[layer_idx].append(activation)
 
-            if req_id not in extension._captured_states:
-                extension._captured_states[req_id] = {}
-            layer_states = extension._captured_states[req_id]
-            if layer_idx not in layer_states:
-                layer_states[layer_idx] = []
-            layer_states[layer_idx].append(activation)
+            if output_intrinsic_metrics is not None:
+                prompt_len = _request_prompt_len(runner, req_state, i)
+                if prompt_len is None:
+                    logger.warning(
+                        "Cannot determine prompt length for %s; skipping metrics "
+                        "capture on this step.",
+                        req_id,
+                    )
+                    continue
+                abs_start = _sequence_start(
+                    selected_attn_metadata, req_state, i, n_query
+                )
+                rel_indices = _metric_relative_indices(
+                    abs_start, n_query, prompt_len, hidden_states.device
+                )
+                if rel_indices.numel() == 0:
+                    continue
+                metric_options = normalize_metric_options(output_intrinsic_metrics)
+                metric_activation = hidden_states[start:end].index_select(0, rel_indices)
+                if metric_options["metrics_storage"] == "gpu":
+                    metric_activation = metric_activation.detach().clone()
+                else:
+                    metric_activation = metric_activation.detach().cpu()
+
+                if req_id not in extension._metric_states:
+                    extension._metric_states[req_id] = {}
+                metric_layer_states = extension._metric_states[req_id]
+                if layer_idx not in metric_layer_states:
+                    metric_layer_states[layer_idx] = []
+                metric_layer_states[layer_idx].append(metric_activation)
 
     return modified_output
 
@@ -373,6 +475,10 @@ class HiddenStatesExtension:
         str,
         dict[int, list[Float[torch.Tensor, "seq_len hidden_dim"]]],  # type: ignore[reportUndefinedVariable]
     ] = {}
+    _metric_states: dict[
+        str,
+        dict[int, list[Float[torch.Tensor, "seq_len hidden_dim"]]],  # type: ignore[reportUndefinedVariable]
+    ] = {}
     _hooks_installed: bool = False
 
     # Per-request steering configs:
@@ -398,6 +504,7 @@ class HiddenStatesExtension:
         self._hooks_installed = True
         # Reset to instance-level dicts (class-level defaults are shared)
         self._captured_states = {}
+        self._metric_states = {}
         self._steering_data = {}
 
         # Only rank 0 captures — residual streams are replicated across
@@ -469,6 +576,10 @@ class HiddenStatesExtension:
             if req_id.startswith(prefix):
                 del self._captured_states[req_id]
                 logger.debug("Cleared leaked activations for %s", req_id)
+        for req_id in list(self._metric_states):
+            if req_id.startswith(prefix):
+                del self._metric_states[req_id]
+                logger.debug("Cleared leaked metric activations for %s", req_id)
 
     def get_captured_states(self, external_req_id: str) -> bytes | None:
         """Retrieve captured activations for a specific request.
@@ -526,7 +637,7 @@ class HiddenStatesExtension:
         back to the driver.
         """
         prefix = f"{external_req_id}-"
-        for req_id, layer_dict in self._captured_states.items():
+        for req_id, layer_dict in self._metric_states.items():
             if not req_id.startswith(prefix):
                 continue
 
@@ -551,6 +662,7 @@ class HiddenStatesExtension:
             )
 
             metric_options = normalize_metric_options(options)
+            metric_options["response_positions_only"] = True
             metrics = compute_intrinsic_metrics_from_activations(
                 residual_stream,
                 _get_logits_fn(self.model_runner.model),
@@ -560,10 +672,11 @@ class HiddenStatesExtension:
                 final_logits_fn=_get_final_logits_fn(self.model_runner.model),
                 **metric_options,
             )
+            self._metric_states.pop(req_id, None)
             return _ZSTD_COMPRESSOR.compress(pickle.dumps(metrics))
 
         return None
 
     def _debug_captured_states_count(self) -> int:
-        """Return the number of entries in _captured_states (for testing)."""
-        return len(self._captured_states)
+        """Return the number of captured-state entries (for testing)."""
+        return len(self._captured_states) + len(self._metric_states)

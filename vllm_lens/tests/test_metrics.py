@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from vllm_lens.metrics import (
+    jsd_from_logits,
+    kl_uniform_to_probs,
     compute_intrinsic_metrics_from_activations,
     normalize_metric_options,
 )
@@ -15,6 +17,8 @@ def test_normalize_metric_options_defaults() -> None:
     assert normalize_metric_options(True) == {
         "jsd_threshold": 0.02,
         "deep_layer_fraction": 0.25,
+        "logits_batch_size": 128,
+        "metrics_storage": "cpu",
     }
 
 
@@ -24,6 +28,21 @@ def test_normalize_metric_options_custom() -> None:
     ) == {
         "jsd_threshold": 0.1,
         "deep_layer_fraction": 0.5,
+        "logits_batch_size": 128,
+        "metrics_storage": "cpu",
+    }
+    assert normalize_metric_options(
+        {
+            "jsd_threshold": 0.1,
+            "deep_layer_fraction": 0.5,
+            "logits_batch_size": 4,
+            "metrics_storage": "gpu",
+        }
+    ) == {
+        "jsd_threshold": 0.1,
+        "deep_layer_fraction": 0.5,
+        "logits_batch_size": 4,
+        "metrics_storage": "gpu",
     }
 
 
@@ -31,20 +50,28 @@ def test_normalize_metric_options_from_openai_xargs_string() -> None:
     assert normalize_metric_options("true") == {
         "jsd_threshold": 0.02,
         "deep_layer_fraction": 0.25,
+        "logits_batch_size": 128,
+        "metrics_storage": "cpu",
     }
     assert normalize_metric_options(["true"]) == {
         "jsd_threshold": 0.02,
         "deep_layer_fraction": 0.25,
+        "logits_batch_size": 128,
+        "metrics_storage": "cpu",
     }
     assert normalize_metric_options(1) == {
         "jsd_threshold": 0.02,
         "deep_layer_fraction": 0.25,
+        "logits_batch_size": 128,
+        "metrics_storage": "cpu",
     }
     assert normalize_metric_options(
         '{"jsd_threshold": 0.1, "deep_layer_fraction": 0.5}'
     ) == {
         "jsd_threshold": 0.1,
         "deep_layer_fraction": 0.5,
+        "logits_batch_size": 128,
+        "metrics_storage": "cpu",
     }
 
 
@@ -133,3 +160,116 @@ def test_compute_intrinsic_metrics_uses_final_logits_fn_for_targets() -> None:
     assert metrics["average_log_probability"] == pytest.approx(
         torch.log_softmax(torch.tensor([-1.0, 0.0]), dim=-1)[1].item()
     )
+
+
+def _scalar_intrinsic_metrics(
+    residual_stream: torch.Tensor,
+    logits_fn,
+    full_token_ids: list[int],
+    prompt_len: int,
+    *,
+    jsd_threshold: float,
+    deep_layer_fraction: float,
+    final_logits_fn=None,
+) -> dict[str, float]:
+    num_layers = residual_stream.shape[0]
+    deep_start_layer = math.floor(num_layers * (1.0 - deep_layer_fraction)) + 1
+    deep_start_layer = max(1, min(deep_start_layer, num_layers))
+
+    token_logprobs: list[float] = []
+    token_self_certainties: list[float] = []
+    deep_thinking_flags: list[int] = []
+
+    for pos in range(prompt_len, len(full_token_ids)):
+        prev_pos = pos - 1
+        token_id = full_token_ids[pos]
+        final_logits = (final_logits_fn or logits_fn)(
+            residual_stream[-1, prev_pos].unsqueeze(0)
+        )[0]
+        final_log_probs = torch.log_softmax(final_logits.float(), dim=-1)
+        token_logprobs.append(float(final_log_probs[token_id].item()))
+        token_self_certainties.append(float(kl_uniform_to_probs(final_logits).item()))
+
+        jsd_per_layer: list[float] = []
+        for layer_idx in range(num_layers):
+            layer_logits = logits_fn(residual_stream[layer_idx, prev_pos].unsqueeze(0))[
+                0
+            ]
+            jsd_per_layer.append(
+                float(jsd_from_logits(layer_logits, final_logits).detach())
+            )
+
+        settling_depth = num_layers
+        for layer_idx in range(1, num_layers + 1):
+            tail = jsd_per_layer[layer_idx - 1 :]
+            if tail and tail[0] <= jsd_threshold and all(
+                v <= jsd_threshold for v in tail
+            ):
+                settling_depth = layer_idx
+                break
+        deep_thinking_flags.append(int(settling_depth >= deep_start_layer))
+
+    denom = max(len(token_logprobs), 1)
+    return {
+        "deep_thinking_ratio": float(sum(deep_thinking_flags) / denom),
+        "self_certainty": float(sum(token_self_certainties) / denom),
+        "average_log_probability": float(sum(token_logprobs) / denom),
+        "num_response_tokens": float(len(token_logprobs)),
+        "deep_layer_start": float(deep_start_layer),
+        "num_layers": float(num_layers),
+        "jsd_threshold": float(jsd_threshold),
+    }
+
+
+def test_vectorized_metrics_match_scalar_reference() -> None:
+    torch.manual_seed(0)
+    lm_head = torch.nn.Linear(7, 11, bias=False)
+    residual_stream = torch.randn(4, 8, 7)
+    full_token_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    expected = _scalar_intrinsic_metrics(
+        residual_stream,
+        lm_head,
+        full_token_ids,
+        prompt_len=3,
+        jsd_threshold=0.03,
+        deep_layer_fraction=0.5,
+    )
+    actual = compute_intrinsic_metrics_from_activations(
+        residual_stream,
+        lm_head,
+        full_token_ids,
+        prompt_len=3,
+        jsd_threshold=0.03,
+        deep_layer_fraction=0.5,
+        logits_batch_size=3,
+    )
+
+    assert actual == pytest.approx(expected, abs=1e-6)
+
+
+def test_response_positions_only_metrics_match_full_stream() -> None:
+    torch.manual_seed(1)
+    lm_head = torch.nn.Linear(5, 13, bias=False)
+    residual_stream = torch.randn(3, 9, 5)
+    full_token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+    prompt_len = 4
+    response_positions = residual_stream[:, prompt_len - 1 : len(full_token_ids) - 1]
+
+    full_metrics = compute_intrinsic_metrics_from_activations(
+        residual_stream,
+        lm_head,
+        full_token_ids,
+        prompt_len=prompt_len,
+        logits_batch_size=2,
+    )
+    response_only_metrics = compute_intrinsic_metrics_from_activations(
+        response_positions,
+        lm_head,
+        full_token_ids,
+        prompt_len=prompt_len,
+        logits_batch_size=2,
+        response_positions_only=True,
+    )
+
+    assert response_only_metrics == pytest.approx(full_metrics, abs=1e-6)

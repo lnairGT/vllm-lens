@@ -30,8 +30,8 @@ def jsd_from_logits(
     m = 0.5 * (p + q)
 
     log_m = (m + eps).log()
-    kl_pm = torch.sum(p * (log_p - log_m))
-    kl_qm = torch.sum(q * (log_q - log_m))
+    kl_pm = torch.sum(p * (log_p - log_m), dim=-1)
+    kl_qm = torch.sum(q * (log_q - log_m), dim=-1)
     return 0.5 * (kl_pm + kl_qm)
 
 
@@ -42,10 +42,10 @@ def kl_uniform_to_probs(logits: torch.Tensor, eps: float = 1e-12) -> torch.Tenso
     vocab_size = logits.shape[-1]
     u = 1.0 / vocab_size
     log_u = math.log(u)
-    return torch.sum(torch.full_like(log_p, u) * (log_u - log_p))
+    return torch.sum(torch.full_like(log_p, u) * (log_u - log_p), dim=-1)
 
 
-def normalize_metric_options(options: Any | None) -> dict[str, float]:
+def normalize_metric_options(options: Any | None) -> dict[str, Any]:
     """Normalize ``extra_args["output_intrinsic_metrics"]``."""
     if isinstance(options, (list, tuple)) and len(options) == 1:
         options = options[0]
@@ -74,10 +74,53 @@ def normalize_metric_options(options: Any | None) -> dict[str, float]:
             f"got {type(options).__name__}: {options!r}"
         )
 
+    logits_batch_size = int(options.get("logits_batch_size", 128))
+    if logits_batch_size <= 0:
+        raise ValueError("logits_batch_size must be positive")
+
+    metrics_storage = str(options.get("metrics_storage", "cpu")).lower()
+    if metrics_storage not in {"cpu", "gpu"}:
+        raise ValueError('metrics_storage must be either "cpu" or "gpu"')
+
     return {
         "jsd_threshold": float(options.get("jsd_threshold", 0.02)),
         "deep_layer_fraction": float(options.get("deep_layer_fraction", 0.25)),
+        "logits_batch_size": logits_batch_size,
+        "metrics_storage": metrics_storage,
     }
+
+
+def _response_hidden_states(
+    residual_stream: torch.Tensor,
+    full_token_ids: list[int],
+    prompt_len: int,
+    *,
+    response_positions_only: bool,
+) -> torch.Tensor:
+    num_response_tokens = len(full_token_ids) - prompt_len
+    if num_response_tokens <= 0:
+        return residual_stream[:, :0, :]
+
+    if response_positions_only:
+        if residual_stream.shape[1] < num_response_tokens:
+            raise ValueError(
+                "residual_stream is shorter than the response token sequence: "
+                f"{residual_stream.shape[1]} < {num_response_tokens}"
+            )
+        return residual_stream[:, :num_response_tokens, :]
+
+    expected_activation_len = max(len(full_token_ids) - 1, 0)
+    activation_seq_len = residual_stream.shape[1]
+    if activation_seq_len < expected_activation_len:
+        raise ValueError(
+            "residual_stream is shorter than the token sequence: "
+            f"{activation_seq_len} < {expected_activation_len}"
+        )
+    if activation_seq_len > expected_activation_len:
+        residual_stream = residual_stream[:, :expected_activation_len, :]
+
+    prev_positions = torch.arange(prompt_len - 1, len(full_token_ids) - 1)
+    return residual_stream.index_select(1, prev_positions.to(residual_stream.device))
 
 
 @torch.no_grad()
@@ -91,6 +134,9 @@ def compute_intrinsic_metrics_from_activations(
     deep_layer_fraction: float = 0.25,
     logits_device: torch.device | None = None,
     final_logits_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    logits_batch_size: int = 128,
+    response_positions_only: bool = False,
+    metrics_storage: str | None = None,
 ) -> dict[str, float]:
     """Compute DTR, self-certainty, and average log probability.
 
@@ -109,65 +155,89 @@ def compute_intrinsic_metrics_from_activations(
     if prompt_len > len(full_token_ids):
         raise ValueError("prompt_len cannot exceed len(full_token_ids)")
 
-    num_layers, activation_seq_len, _ = residual_stream.shape
-    expected_activation_len = max(len(full_token_ids) - 1, 0)
-    if activation_seq_len < expected_activation_len:
-        raise ValueError(
-            "residual_stream is shorter than the token sequence: "
-            f"{activation_seq_len} < {expected_activation_len}"
-        )
-    if activation_seq_len > expected_activation_len:
-        residual_stream = residual_stream[:, :expected_activation_len, :]
+    if logits_batch_size <= 0:
+        raise ValueError("logits_batch_size must be positive")
+    del metrics_storage
+
+    num_layers, _, _ = residual_stream.shape
+    response_hidden = _response_hidden_states(
+        residual_stream,
+        full_token_ids,
+        prompt_len,
+        response_positions_only=response_positions_only,
+    )
+    num_response_tokens = response_hidden.shape[1]
 
     deep_start_layer = math.floor(num_layers * (1.0 - deep_layer_fraction)) + 1
     deep_start_layer = max(1, min(deep_start_layer, num_layers))
 
-    token_logprobs: list[float] = []
-    token_self_certainties: list[float] = []
-    deep_thinking_flags: list[int] = []
+    if num_response_tokens == 0:
+        return {
+            "deep_thinking_ratio": 0.0,
+            "self_certainty": 0.0,
+            "average_log_probability": 0.0,
+            "num_response_tokens": 0.0,
+            "deep_layer_start": float(deep_start_layer),
+            "num_layers": float(num_layers),
+            "jsd_threshold": float(jsd_threshold),
+        }
 
     device = logits_device or residual_stream.device
+    response_token_ids = torch.tensor(
+        full_token_ids[prompt_len:], dtype=torch.long, device=device
+    )
 
-    for pos in range(prompt_len, len(full_token_ids)):
-        prev_pos = pos - 1
-        token_id = int(full_token_ids[pos])
+    final_hidden = response_hidden[-1].to(device=device)
+    final_logits = (final_logits_fn or logits_fn)(final_hidden)
+    if final_logits.dim() == 1:
+        final_logits = final_logits.unsqueeze(0)
+    vocab_size = final_logits.shape[-1]
+    too_large = response_token_ids >= vocab_size
+    if bool(torch.any(too_large).item()):
+        token_id = int(response_token_ids[too_large][0].item())
+        raise ValueError(
+            f"token_id {token_id} is outside output vocab size {vocab_size}"
+        )
 
-        final_hidden = residual_stream[-1, prev_pos].to(device=device)
-        final_logits = (final_logits_fn or logits_fn)(final_hidden.unsqueeze(0))[0]
-        final_log_probs = F.log_softmax(final_logits.float(), dim=-1)
-        if token_id >= final_logits.shape[-1]:
-            raise ValueError(
-                f"token_id {token_id} is outside output vocab size "
-                f"{final_logits.shape[-1]}"
-            )
-        token_logprobs.append(float(final_log_probs[token_id].item()))
-        token_self_certainties.append(float(kl_uniform_to_probs(final_logits).item()))
+    final_log_probs = F.log_softmax(final_logits.float(), dim=-1)
+    token_logprobs_t = final_log_probs.gather(1, response_token_ids[:, None]).squeeze(1)
+    token_self_certainties_t = kl_uniform_to_probs(final_logits)
 
-        jsd_per_layer: list[float] = []
-        for layer_idx in range(num_layers):
-            hidden = residual_stream[layer_idx, prev_pos].to(device=device)
-            layer_logits = logits_fn(hidden.unsqueeze(0))[0]
-            jsd_per_layer.append(
-                float(jsd_from_logits(layer_logits, final_logits).item())
-            )
+    jsd_per_layer = torch.empty(
+        (num_layers, num_response_tokens), dtype=torch.float32, device=device
+    )
+    flat_hidden = response_hidden.reshape(num_layers * num_response_tokens, -1)
+    for start in range(0, flat_hidden.shape[0], logits_batch_size):
+        end = min(start + logits_batch_size, flat_hidden.shape[0])
+        hidden = flat_hidden[start:end].to(device=device)
+        layer_logits = logits_fn(hidden)
+        if layer_logits.dim() == 1:
+            layer_logits = layer_logits.unsqueeze(0)
+        token_indices = torch.arange(start, end, device=device) % num_response_tokens
+        expanded_final = final_logits.index_select(0, token_indices)
+        jsd_per_layer.reshape(-1)[start:end] = jsd_from_logits(
+            layer_logits, expanded_final
+        )
 
-        settling_depth = num_layers
-        for layer_idx in range(1, num_layers + 1):
-            tail = jsd_per_layer[layer_idx - 1 :]
-            if tail and tail[0] <= jsd_threshold and all(
-                v <= jsd_threshold for v in tail
-            ):
-                settling_depth = layer_idx
-                break
+    below_threshold = jsd_per_layer <= jsd_threshold
+    tail_all_below = torch.flip(
+        torch.cumprod(torch.flip(below_threshold.to(torch.int8), dims=(0,)), dim=0),
+        dims=(0,),
+    ).bool()
+    first_below = tail_all_below.float().argmax(dim=0) + 1
+    has_below = tail_all_below.any(dim=0)
+    settling_depth = torch.where(
+        has_below,
+        first_below,
+        torch.full_like(first_below, num_layers),
+    )
+    deep_thinking_flags_t = (settling_depth >= deep_start_layer).float()
 
-        deep_thinking_flags.append(int(settling_depth >= deep_start_layer))
-
-    denom = max(len(token_logprobs), 1)
     return {
-        "deep_thinking_ratio": float(sum(deep_thinking_flags) / denom),
-        "self_certainty": float(sum(token_self_certainties) / denom),
-        "average_log_probability": float(sum(token_logprobs) / denom),
-        "num_response_tokens": float(len(token_logprobs)),
+        "deep_thinking_ratio": float(deep_thinking_flags_t.mean().item()),
+        "self_certainty": float(token_self_certainties_t.mean().item()),
+        "average_log_probability": float(token_logprobs_t.mean().item()),
+        "num_response_tokens": float(num_response_tokens),
         "deep_layer_start": float(deep_start_layer),
         "num_layers": float(num_layers),
         "jsd_threshold": float(jsd_threshold),
