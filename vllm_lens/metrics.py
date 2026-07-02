@@ -187,8 +187,9 @@ def compute_intrinsic_metrics_from_activations(
         full_token_ids[prompt_len:], dtype=torch.long, device=device
     )
 
+    final_logits_fn_resolved = final_logits_fn or logits_fn
     final_hidden = response_hidden[-1].to(device=device)
-    final_logits = (final_logits_fn or logits_fn)(final_hidden)
+    final_logits = final_logits_fn_resolved(final_hidden)
     if final_logits.dim() == 1:
         final_logits = final_logits.unsqueeze(0)
     vocab_size = final_logits.shape[-1]
@@ -206,18 +207,21 @@ def compute_intrinsic_metrics_from_activations(
     jsd_per_layer = torch.empty(
         (num_layers, num_response_tokens), dtype=torch.float32, device=device
     )
-    flat_hidden = response_hidden.reshape(num_layers * num_response_tokens, -1)
-    for start in range(0, flat_hidden.shape[0], logits_batch_size):
-        end = min(start + logits_batch_size, flat_hidden.shape[0])
-        hidden = flat_hidden[start:end].to(device=device)
-        layer_logits = logits_fn(hidden)
-        if layer_logits.dim() == 1:
-            layer_logits = layer_logits.unsqueeze(0)
-        token_indices = torch.arange(start, end, device=device) % num_response_tokens
-        expanded_final = final_logits.index_select(0, token_indices)
-        jsd_per_layer.reshape(-1)[start:end] = jsd_from_logits(
-            layer_logits, expanded_final
+    for layer_idx in range(num_layers):
+        layer_hidden_all = response_hidden[layer_idx]
+        layer_logits_fn = (
+            final_logits_fn_resolved if layer_idx == num_layers - 1 else logits_fn
         )
+        for start in range(0, num_response_tokens, logits_batch_size):
+            end = min(start + logits_batch_size, num_response_tokens)
+            hidden = layer_hidden_all[start:end].to(device=device)
+            layer_logits = layer_logits_fn(hidden)
+            if layer_logits.dim() == 1:
+                layer_logits = layer_logits.unsqueeze(0)
+            expanded_final = final_logits[start:end]
+            jsd_per_layer[layer_idx, start:end] = jsd_from_logits(
+                layer_logits, expanded_final
+            )
 
     below_threshold = jsd_per_layer <= jsd_threshold
     tail_all_below = torch.flip(

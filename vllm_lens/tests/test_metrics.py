@@ -162,6 +162,32 @@ def test_compute_intrinsic_metrics_uses_final_logits_fn_for_targets() -> None:
     )
 
 
+def test_final_layer_jsd_uses_final_logits_fn_when_available() -> None:
+    lm_head = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        lm_head.weight.copy_(torch.eye(2))
+
+    residual_stream = torch.tensor(
+        [
+            [[-1.0, 0.0]],
+            [[1.0, 0.0]],
+        ]
+    )
+    full_token_ids = [0, 1]
+
+    metrics = compute_intrinsic_metrics_from_activations(
+        residual_stream,
+        lm_head,
+        full_token_ids,
+        prompt_len=1,
+        jsd_threshold=1e-7,
+        deep_layer_fraction=0.5,
+        final_logits_fn=lambda hidden: lm_head(-hidden),
+    )
+
+    assert metrics["deep_thinking_ratio"] == 0.0
+
+
 def _scalar_intrinsic_metrics(
     residual_stream: torch.Tensor,
     logits_fn,
