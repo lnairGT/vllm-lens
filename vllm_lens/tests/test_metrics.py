@@ -18,7 +18,6 @@ def test_normalize_metric_options_defaults() -> None:
     assert normalize_metric_options(True) == {
         "jsd_threshold": 0.5,
         "deep_layer_fraction": 0.85,
-        "lsc_tolerance": 1e-3,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
@@ -30,7 +29,6 @@ def test_normalize_metric_options_custom() -> None:
     ) == {
         "jsd_threshold": 0.1,
         "deep_layer_fraction": 0.5,
-        "lsc_tolerance": 1e-3,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
@@ -38,14 +36,12 @@ def test_normalize_metric_options_custom() -> None:
         {
             "jsd_threshold": 0.1,
             "deep_layer_fraction": 0.5,
-            "lsc_tolerance": 0.01,
             "logits_batch_size": 4,
             "metrics_storage": "gpu",
         }
     ) == {
         "jsd_threshold": 0.1,
         "deep_layer_fraction": 0.5,
-        "lsc_tolerance": 0.01,
         "logits_batch_size": 4,
         "metrics_storage": "gpu",
     }
@@ -55,21 +51,18 @@ def test_normalize_metric_options_from_openai_xargs_string() -> None:
     assert normalize_metric_options("true") == {
         "jsd_threshold": 0.5,
         "deep_layer_fraction": 0.85,
-        "lsc_tolerance": 1e-3,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
     assert normalize_metric_options(["true"]) == {
         "jsd_threshold": 0.5,
         "deep_layer_fraction": 0.85,
-        "lsc_tolerance": 1e-3,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
     assert normalize_metric_options(1) == {
         "jsd_threshold": 0.5,
         "deep_layer_fraction": 0.85,
-        "lsc_tolerance": 1e-3,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
@@ -78,7 +71,6 @@ def test_normalize_metric_options_from_openai_xargs_string() -> None:
     ) == {
         "jsd_threshold": 0.1,
         "deep_layer_fraction": 0.5,
-        "lsc_tolerance": 1e-3,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
@@ -87,8 +79,8 @@ def test_normalize_metric_options_from_openai_xargs_string() -> None:
 def test_normalize_metric_options_rejects_invalid() -> None:
     with pytest.raises(TypeError):
         normalize_metric_options("yes")
-    with pytest.raises(ValueError, match="lsc_tolerance"):
-        normalize_metric_options({"lsc_tolerance": -1.0})
+    with pytest.raises(ValueError, match="logits_batch_size"):
+        normalize_metric_options({"logits_batch_size": 0})
 
 
 def test_normalized_confidence_from_logits_is_bounded() -> None:
@@ -147,21 +139,21 @@ def test_compute_intrinsic_metrics_from_activations() -> None:
         "settled_deep_thinking_ratio",
         "average_deep_thinking_settling_depth",
         "self_certainty",
-        "layerwise_self_certainty_settling_depth",
-        "layerwise_self_certainty_deep_thinking_ratio",
-        "settled_layerwise_self_certainty_deep_thinking_ratio",
         "normalized_confidence",
         "average_log_probability",
+        "negative_perplexity",
         "num_response_tokens",
         "deep_layer_start",
         "num_layers",
         "jsd_threshold",
-        "lsc_tolerance",
     }
     assert metrics["num_response_tokens"] == 2.0
     assert metrics["num_layers"] == 2.0
     assert metrics["deep_layer_start"] == 1.0
     assert metrics["jsd_threshold"] == 1.0
+    assert metrics["negative_perplexity"] == pytest.approx(
+        math.exp(-metrics["average_log_probability"])
+    )
     assert all(math.isfinite(v) for v in metrics.values())
 
 
@@ -290,52 +282,6 @@ def test_settled_deep_thinking_ratio_is_conditional_on_deep_thinking() -> None:
     assert metrics["settled_deep_thinking_ratio"] == 0.5
 
 
-def test_settled_lsc_deep_thinking_ratio_is_conditional_on_lsc_dtr() -> None:
-    final_logits = torch.tensor([6.0, -6.0])
-    near_final_logits = torch.tensor([6.001, -6.001])
-    uniform_logits = torch.tensor([0.0, 0.0])
-    per_layer_logits = torch.stack(
-        [
-            uniform_logits,
-            uniform_logits,
-            uniform_logits,
-            uniform_logits,
-            near_final_logits,
-            near_final_logits,
-            near_final_logits,
-            uniform_logits,
-            final_logits,
-            final_logits,
-        ]
-    )
-
-    def logits_fn(hidden: torch.Tensor) -> torch.Tensor:
-        return per_layer_logits.index_select(0, hidden.long().view(-1))
-
-    residual_stream = torch.tensor(
-        [
-            [[0], [1]],
-            [[2], [3]],
-            [[4], [5]],
-            [[6], [7]],
-            [[8], [9]],
-        ]
-    )
-
-    metrics = compute_intrinsic_metrics_from_activations(
-        residual_stream,
-        logits_fn,
-        full_token_ids=[0, 0, 0],
-        prompt_len=1,
-        deep_layer_fraction=0.6,
-        lsc_tolerance=0.01,
-        final_logits_fn=lambda hidden: final_logits.expand(hidden.shape[0], -1),
-    )
-
-    assert metrics["deep_layer_start"] == 3.0
-    assert metrics["settled_layerwise_self_certainty_deep_thinking_ratio"] == 0.5
-
-
 def test_average_deep_thinking_settling_depth() -> None:
     final_logits = torch.tensor([10.0, -10.0])
     per_layer_logits = torch.tensor(
@@ -380,7 +326,6 @@ def _scalar_intrinsic_metrics(
     *,
     jsd_threshold: float,
     deep_layer_fraction: float,
-    lsc_tolerance: float = 1e-3,
     final_logits_fn=None,
 ) -> dict[str, float]:
     num_layers = residual_stream.shape[0]
@@ -390,10 +335,6 @@ def _scalar_intrinsic_metrics(
     token_logprobs: list[float] = []
     token_self_certainties: list[float] = []
     token_normalized_confidences: list[float] = []
-    lsc_settling_depths: list[int] = []
-    lsc_deep_thinking_flags: list[int] = []
-    lsc_crossing_deep_thinking_flags: list[int] = []
-    settled_lsc_deep_thinking_flags: list[int] = []
     deep_thinking_flags: list[int] = []
     settled_deep_thinking_flags: list[int] = []
     deep_thinking_settling_depths: list[int] = []
@@ -412,7 +353,6 @@ def _scalar_intrinsic_metrics(
         )
 
         jsd_per_layer: list[float] = []
-        self_certainty_per_layer: list[float] = []
         for layer_idx in range(num_layers):
             logits_fn_for_layer = (
                 (final_logits_fn or logits_fn)
@@ -424,9 +364,6 @@ def _scalar_intrinsic_metrics(
             )[0]
             jsd_per_layer.append(
                 float(jsd_from_logits(layer_logits, final_logits).detach())
-            )
-            self_certainty_per_layer.append(
-                float(kl_uniform_to_probs(layer_logits).detach())
             )
 
         settling_depth = num_layers
@@ -451,43 +388,9 @@ def _scalar_intrinsic_metrics(
             int(is_deep_thinking and settled_depth <= settling_depth)
         )
 
-        lsc_crossing_depth = num_layers
-        running_min_lsc_distance = math.inf
-        final_self_certainty = self_certainty_per_layer[-1]
-        for layer_idx in range(1, num_layers + 1):
-            lsc_distance = abs(
-                self_certainty_per_layer[layer_idx - 1] - final_self_certainty
-            )
-            running_min_lsc_distance = min(running_min_lsc_distance, lsc_distance)
-            if running_min_lsc_distance <= lsc_tolerance:
-                lsc_crossing_depth = layer_idx
-                break
-        is_lsc_crossing_deep_thinking = int(
-            lsc_crossing_depth >= deep_start_layer
-        )
-        lsc_crossing_deep_thinking_flags.append(is_lsc_crossing_deep_thinking)
-
-        lsc_settling_depth = num_layers
-        for layer_idx in range(1, num_layers + 1):
-            suffix_self_certainties = self_certainty_per_layer[layer_idx - 1 :]
-            if all(
-                abs(self_certainty - final_self_certainty) <= lsc_tolerance
-                for self_certainty in suffix_self_certainties
-            ):
-                lsc_settling_depth = layer_idx
-                break
-        lsc_settling_depths.append(lsc_settling_depth)
-        lsc_deep_thinking_flags.append(int(lsc_settling_depth >= deep_start_layer))
-        settled_lsc_deep_thinking_flags.append(
-            int(
-                is_lsc_crossing_deep_thinking
-                and lsc_settling_depth <= lsc_crossing_depth
-            )
-        )
-
     denom = max(len(token_logprobs), 1)
     depth_denom = max(len(deep_thinking_settling_depths), 1)
-    lsc_depth_denom = max(num_layers - 1, 1)
+    average_log_probability = float(sum(token_logprobs) / denom)
     return {
         "deep_thinking_ratio": float(sum(deep_thinking_flags) / denom),
         "settled_deep_thinking_ratio": float(
@@ -497,24 +400,13 @@ def _scalar_intrinsic_metrics(
             sum(deep_thinking_settling_depths) / depth_denom
         ),
         "self_certainty": float(sum(token_self_certainties) / denom),
-        "layerwise_self_certainty_settling_depth": float(
-            sum((depth - 1) / lsc_depth_denom for depth in lsc_settling_depths)
-            / denom
-        ),
-        "layerwise_self_certainty_deep_thinking_ratio": float(
-            sum(lsc_deep_thinking_flags) / denom
-        ),
-        "settled_layerwise_self_certainty_deep_thinking_ratio": float(
-            sum(settled_lsc_deep_thinking_flags)
-            / max(sum(lsc_crossing_deep_thinking_flags), 1)
-        ),
         "normalized_confidence": float(sum(token_normalized_confidences) / denom),
-        "average_log_probability": float(sum(token_logprobs) / denom),
+        "average_log_probability": average_log_probability,
+        "negative_perplexity": math.exp(-average_log_probability),
         "num_response_tokens": float(len(token_logprobs)),
         "deep_layer_start": float(deep_start_layer),
         "num_layers": float(num_layers),
         "jsd_threshold": float(jsd_threshold),
-        "lsc_tolerance": float(lsc_tolerance),
     }
 
 
