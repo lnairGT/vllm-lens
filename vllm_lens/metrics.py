@@ -83,8 +83,8 @@ def normalize_metric_options(options: Any | None) -> dict[str, Any]:
         raise ValueError('metrics_storage must be either "cpu" or "gpu"')
 
     return {
-        "jsd_threshold": float(options.get("jsd_threshold", 0.02)),
-        "deep_layer_fraction": float(options.get("deep_layer_fraction", 0.25)),
+        "jsd_threshold": float(options.get("jsd_threshold", 0.5)),
+        "deep_layer_fraction": float(options.get("deep_layer_fraction", 0.85)),
         "logits_batch_size": logits_batch_size,
         "metrics_storage": metrics_storage,
     }
@@ -130,8 +130,8 @@ def compute_intrinsic_metrics_from_activations(
     full_token_ids: list[int],
     prompt_len: int,
     *,
-    jsd_threshold: float = 0.02,
-    deep_layer_fraction: float = 0.25,
+    jsd_threshold: float = 0.5,
+    deep_layer_fraction: float = 0.85,
     logits_device: torch.device | None = None,
     final_logits_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     logits_batch_size: int = 128,
@@ -168,7 +168,7 @@ def compute_intrinsic_metrics_from_activations(
     )
     num_response_tokens = response_hidden.shape[1]
 
-    deep_start_layer = math.floor(num_layers * (1.0 - deep_layer_fraction)) + 1
+    deep_start_layer = math.ceil(num_layers * deep_layer_fraction)
     deep_start_layer = max(1, min(deep_start_layer, num_layers))
 
     if num_response_tokens == 0:
@@ -223,13 +223,10 @@ def compute_intrinsic_metrics_from_activations(
                 layer_logits, expanded_final
             )
 
-    below_threshold = jsd_per_layer <= jsd_threshold
-    tail_all_below = torch.flip(
-        torch.cumprod(torch.flip(below_threshold.to(torch.int8), dims=(0,)), dim=0),
-        dims=(0,),
-    ).bool()
-    first_below = tail_all_below.float().argmax(dim=0) + 1
-    has_below = tail_all_below.any(dim=0)
+    running_min_jsd = torch.cummin(jsd_per_layer, dim=0).values
+    below_threshold = running_min_jsd <= jsd_threshold
+    first_below = below_threshold.float().argmax(dim=0) + 1
+    has_below = below_threshold.any(dim=0)
     settling_depth = torch.where(
         has_below,
         first_below,

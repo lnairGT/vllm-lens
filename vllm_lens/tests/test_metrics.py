@@ -15,8 +15,8 @@ from vllm_lens.metrics import (
 
 def test_normalize_metric_options_defaults() -> None:
     assert normalize_metric_options(True) == {
-        "jsd_threshold": 0.02,
-        "deep_layer_fraction": 0.25,
+        "jsd_threshold": 0.5,
+        "deep_layer_fraction": 0.85,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
@@ -48,20 +48,20 @@ def test_normalize_metric_options_custom() -> None:
 
 def test_normalize_metric_options_from_openai_xargs_string() -> None:
     assert normalize_metric_options("true") == {
-        "jsd_threshold": 0.02,
-        "deep_layer_fraction": 0.25,
+        "jsd_threshold": 0.5,
+        "deep_layer_fraction": 0.85,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
     assert normalize_metric_options(["true"]) == {
-        "jsd_threshold": 0.02,
-        "deep_layer_fraction": 0.25,
+        "jsd_threshold": 0.5,
+        "deep_layer_fraction": 0.85,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
     assert normalize_metric_options(1) == {
-        "jsd_threshold": 0.02,
-        "deep_layer_fraction": 0.25,
+        "jsd_threshold": 0.5,
+        "deep_layer_fraction": 0.85,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
     }
@@ -131,7 +131,7 @@ def test_compute_intrinsic_metrics_from_activations() -> None:
     }
     assert metrics["num_response_tokens"] == 2.0
     assert metrics["num_layers"] == 2.0
-    assert metrics["deep_layer_start"] == 2.0
+    assert metrics["deep_layer_start"] == 1.0
     assert metrics["jsd_threshold"] == 1.0
     assert all(math.isfinite(v) for v in metrics.values())
 
@@ -169,7 +169,7 @@ def test_final_layer_jsd_uses_final_logits_fn_when_available() -> None:
 
     residual_stream = torch.tensor(
         [
-            [[-1.0, 0.0]],
+            [[1.0, 0.0]],
             [[1.0, 0.0]],
         ]
     )
@@ -181,10 +181,37 @@ def test_final_layer_jsd_uses_final_logits_fn_when_available() -> None:
         full_token_ids,
         prompt_len=1,
         jsd_threshold=1e-7,
-        deep_layer_fraction=0.5,
+        deep_layer_fraction=0.75,
         final_logits_fn=lambda hidden: lm_head(-hidden),
     )
 
+    assert metrics["deep_thinking_ratio"] == 1.0
+
+
+def test_dtr_uses_running_min_settling_depth() -> None:
+    def logits_fn(hidden: torch.Tensor) -> torch.Tensor:
+        return torch.cat([hidden, -hidden], dim=-1)
+
+    residual_stream = torch.tensor(
+        [
+            [[5.0]],
+            [[0.0]],
+            [[5.0]],
+            [[0.0]],
+        ]
+    )
+    full_token_ids = [0, 1]
+
+    metrics = compute_intrinsic_metrics_from_activations(
+        residual_stream,
+        logits_fn,
+        full_token_ids,
+        prompt_len=1,
+        jsd_threshold=0.01,
+        deep_layer_fraction=0.75,
+    )
+
+    assert metrics["deep_layer_start"] == 3.0
     assert metrics["deep_thinking_ratio"] == 0.0
 
 
@@ -199,7 +226,7 @@ def _scalar_intrinsic_metrics(
     final_logits_fn=None,
 ) -> dict[str, float]:
     num_layers = residual_stream.shape[0]
-    deep_start_layer = math.floor(num_layers * (1.0 - deep_layer_fraction)) + 1
+    deep_start_layer = math.ceil(num_layers * deep_layer_fraction)
     deep_start_layer = max(1, min(deep_start_layer, num_layers))
 
     token_logprobs: list[float] = []
@@ -226,11 +253,10 @@ def _scalar_intrinsic_metrics(
             )
 
         settling_depth = num_layers
+        running_min_jsd = math.inf
         for layer_idx in range(1, num_layers + 1):
-            tail = jsd_per_layer[layer_idx - 1 :]
-            if tail and tail[0] <= jsd_threshold and all(
-                v <= jsd_threshold for v in tail
-            ):
+            running_min_jsd = min(running_min_jsd, jsd_per_layer[layer_idx - 1])
+            if running_min_jsd <= jsd_threshold:
                 settling_depth = layer_idx
                 break
         deep_thinking_flags.append(int(settling_depth >= deep_start_layer))
