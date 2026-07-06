@@ -174,6 +174,7 @@ def compute_intrinsic_metrics_from_activations(
     if num_response_tokens == 0:
         return {
             "deep_thinking_ratio": 0.0,
+            "average_deep_thinking_settling_depth": 0.0,
             "self_certainty": 0.0,
             "average_log_probability": 0.0,
             "num_response_tokens": 0.0,
@@ -233,9 +234,16 @@ def compute_intrinsic_metrics_from_activations(
         torch.full_like(first_below, num_layers),
     )
     deep_thinking_flags_t = (settling_depth >= deep_start_layer).float()
+    deep_thinking_depths = settling_depth[deep_thinking_flags_t.bool()].float()
+    average_deep_thinking_settling_depth = (
+        float(deep_thinking_depths.mean().item())
+        if deep_thinking_depths.numel()
+        else 0.0
+    )
 
     return {
         "deep_thinking_ratio": float(deep_thinking_flags_t.mean().item()),
+        "average_deep_thinking_settling_depth": average_deep_thinking_settling_depth,
         "self_certainty": float(token_self_certainties_t.mean().item()),
         "average_log_probability": float(token_logprobs_t.mean().item()),
         "num_response_tokens": float(num_response_tokens),

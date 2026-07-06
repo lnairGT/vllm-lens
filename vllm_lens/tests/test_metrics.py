@@ -122,6 +122,7 @@ def test_compute_intrinsic_metrics_from_activations() -> None:
 
     assert set(metrics) == {
         "deep_thinking_ratio",
+        "average_deep_thinking_settling_depth",
         "self_certainty",
         "average_log_probability",
         "num_response_tokens",
@@ -213,6 +214,43 @@ def test_dtr_uses_running_min_settling_depth() -> None:
 
     assert metrics["deep_layer_start"] == 3.0
     assert metrics["deep_thinking_ratio"] == 0.0
+    assert metrics["average_deep_thinking_settling_depth"] == 0.0
+
+
+def test_average_deep_thinking_settling_depth() -> None:
+    final_logits = torch.tensor([10.0, -10.0])
+    per_layer_logits = torch.tensor(
+        [
+            [[-10.0, 10.0], [-10.0, 10.0]],
+            [[10.0, -10.0], [-10.0, 10.0]],
+            [[10.0, -10.0], [10.0, -10.0]],
+        ]
+    )
+
+    def logits_fn(hidden: torch.Tensor) -> torch.Tensor:
+        return per_layer_logits.view(-1, 2).index_select(0, hidden.long().view(-1))
+
+    residual_stream = torch.tensor(
+        [
+            [[0], [1]],
+            [[2], [3]],
+            [[4], [5]],
+        ]
+    )
+
+    metrics = compute_intrinsic_metrics_from_activations(
+        residual_stream,
+        logits_fn,
+        full_token_ids=[0, 0, 0],
+        prompt_len=1,
+        jsd_threshold=1e-6,
+        deep_layer_fraction=0.5,
+        final_logits_fn=lambda hidden: final_logits.expand(hidden.shape[0], -1),
+    )
+
+    assert metrics["deep_layer_start"] == 2.0
+    assert metrics["deep_thinking_ratio"] == 1.0
+    assert metrics["average_deep_thinking_settling_depth"] == 2.5
 
 
 def _scalar_intrinsic_metrics(
@@ -232,6 +270,7 @@ def _scalar_intrinsic_metrics(
     token_logprobs: list[float] = []
     token_self_certainties: list[float] = []
     deep_thinking_flags: list[int] = []
+    deep_thinking_settling_depths: list[int] = []
 
     for pos in range(prompt_len, len(full_token_ids)):
         prev_pos = pos - 1
@@ -259,11 +298,18 @@ def _scalar_intrinsic_metrics(
             if running_min_jsd <= jsd_threshold:
                 settling_depth = layer_idx
                 break
-        deep_thinking_flags.append(int(settling_depth >= deep_start_layer))
+        is_deep_thinking = int(settling_depth >= deep_start_layer)
+        deep_thinking_flags.append(is_deep_thinking)
+        if is_deep_thinking:
+            deep_thinking_settling_depths.append(settling_depth)
 
     denom = max(len(token_logprobs), 1)
+    depth_denom = max(len(deep_thinking_settling_depths), 1)
     return {
         "deep_thinking_ratio": float(sum(deep_thinking_flags) / denom),
+        "average_deep_thinking_settling_depth": float(
+            sum(deep_thinking_settling_depths) / depth_denom
+        ),
         "self_certainty": float(sum(token_self_certainties) / denom),
         "average_log_probability": float(sum(token_logprobs) / denom),
         "num_response_tokens": float(len(token_logprobs)),
