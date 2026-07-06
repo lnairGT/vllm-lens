@@ -198,6 +198,7 @@ def compute_intrinsic_metrics_from_activations(
             "self_certainty": 0.0,
             "layerwise_self_certainty_settling_depth": 0.0,
             "layerwise_self_certainty_deep_thinking_ratio": 0.0,
+            "settled_layerwise_self_certainty_deep_thinking_ratio": 0.0,
             "normalized_confidence": 0.0,
             "average_log_probability": 0.0,
             "num_response_tokens": 0.0,
@@ -283,13 +284,32 @@ def compute_intrinsic_metrics_from_activations(
         first_settled,
         torch.full_like(first_settled, num_layers),
     )
-    settled_deep_thinking_flags_t = (settled_depth >= deep_start_layer).float()
+    deep_thinking_mask = deep_thinking_flags_t.bool()
+    settled_deep_thinking_count = (
+        ((settled_depth <= settling_depth) & deep_thinking_mask).float().sum()
+    )
+    deep_thinking_count = deep_thinking_flags_t.sum()
+    settled_deep_thinking_ratio = (
+        float((settled_deep_thinking_count / deep_thinking_count).item())
+        if float(deep_thinking_count.item()) > 0.0
+        else 0.0
+    )
 
     final_self_certainty = self_certainty_per_layer[-1]
-    lsc_within_tolerance = (
-        torch.abs(self_certainty_per_layer - final_self_certainty.unsqueeze(0))
-        <= lsc_tolerance
+    lsc_distance = torch.abs(
+        self_certainty_per_layer - final_self_certainty.unsqueeze(0)
     )
+    running_min_lsc_distance = torch.cummin(lsc_distance, dim=0).values
+    lsc_below_tolerance = running_min_lsc_distance <= lsc_tolerance
+    first_lsc_below = lsc_below_tolerance.float().argmax(dim=0) + 1
+    has_lsc_below = lsc_below_tolerance.any(dim=0)
+    lsc_crossing_depth = torch.where(
+        has_lsc_below,
+        first_lsc_below,
+        torch.full_like(first_lsc_below, num_layers),
+    )
+
+    lsc_within_tolerance = lsc_distance <= lsc_tolerance
     lsc_stable_from_layer = (
         torch.cumprod(lsc_within_tolerance.flip(0).int(), dim=0).flip(0).bool()
     )
@@ -303,12 +323,33 @@ def compute_intrinsic_metrics_from_activations(
             lsc_settling_depth, dtype=torch.float32
         )
     lsc_deep_thinking_flags_t = (lsc_settling_depth >= deep_start_layer).float()
+    lsc_crossing_deep_thinking_flags_t = (
+        lsc_crossing_depth >= deep_start_layer
+    ).float()
+    lsc_crossing_deep_thinking_mask = lsc_crossing_deep_thinking_flags_t.bool()
+    settled_lsc_deep_thinking_count = (
+        (
+            (lsc_settling_depth <= lsc_crossing_depth)
+            & lsc_crossing_deep_thinking_mask
+        )
+        .float()
+        .sum()
+    )
+    lsc_crossing_deep_thinking_count = lsc_crossing_deep_thinking_flags_t.sum()
+    settled_lsc_deep_thinking_ratio = (
+        float(
+            (
+                settled_lsc_deep_thinking_count
+                / lsc_crossing_deep_thinking_count
+            ).item()
+        )
+        if float(lsc_crossing_deep_thinking_count.item()) > 0.0
+        else 0.0
+    )
 
     return {
         "deep_thinking_ratio": float(deep_thinking_flags_t.mean().item()),
-        "settled_deep_thinking_ratio": float(
-            settled_deep_thinking_flags_t.mean().item()
-        ),
+        "settled_deep_thinking_ratio": settled_deep_thinking_ratio,
         "average_deep_thinking_settling_depth": average_deep_thinking_settling_depth,
         "self_certainty": float(token_self_certainties_t.mean().item()),
         "layerwise_self_certainty_settling_depth": float(
@@ -316,6 +357,9 @@ def compute_intrinsic_metrics_from_activations(
         ),
         "layerwise_self_certainty_deep_thinking_ratio": float(
             lsc_deep_thinking_flags_t.mean().item()
+        ),
+        "settled_layerwise_self_certainty_deep_thinking_ratio": (
+            settled_lsc_deep_thinking_ratio
         ),
         "normalized_confidence": float(token_normalized_confidences_t.mean().item()),
         "average_log_probability": float(token_logprobs_t.mean().item()),
