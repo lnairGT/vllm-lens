@@ -45,6 +45,17 @@ def kl_uniform_to_probs(logits: torch.Tensor, eps: float = 1e-12) -> torch.Tenso
     return torch.sum(torch.full_like(log_p, u) * (log_u - log_p), dim=-1)
 
 
+def normalized_confidence_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Normalized KL(P || U), equivalent to 1 - H(P) / log(|V|)."""
+    log_p = F.log_softmax(logits.float(), dim=-1)
+    p = log_p.exp()
+    vocab_size = logits.shape[-1]
+    if vocab_size <= 1:
+        return torch.zeros(logits.shape[:-1], dtype=log_p.dtype, device=logits.device)
+    entropy = -torch.sum(p * log_p, dim=-1)
+    return 1.0 - entropy / math.log(vocab_size)
+
+
 def normalize_metric_options(options: Any | None) -> dict[str, Any]:
     """Normalize ``extra_args["output_intrinsic_metrics"]``."""
     if isinstance(options, (list, tuple)) and len(options) == 1:
@@ -176,6 +187,7 @@ def compute_intrinsic_metrics_from_activations(
             "deep_thinking_ratio": 0.0,
             "average_deep_thinking_settling_depth": 0.0,
             "self_certainty": 0.0,
+            "normalized_confidence": 0.0,
             "average_log_probability": 0.0,
             "num_response_tokens": 0.0,
             "deep_layer_start": float(deep_start_layer),
@@ -204,6 +216,7 @@ def compute_intrinsic_metrics_from_activations(
     final_log_probs = F.log_softmax(final_logits.float(), dim=-1)
     token_logprobs_t = final_log_probs.gather(1, response_token_ids[:, None]).squeeze(1)
     token_self_certainties_t = kl_uniform_to_probs(final_logits)
+    token_normalized_confidences_t = normalized_confidence_from_logits(final_logits)
 
     jsd_per_layer = torch.empty(
         (num_layers, num_response_tokens), dtype=torch.float32, device=device
@@ -245,6 +258,7 @@ def compute_intrinsic_metrics_from_activations(
         "deep_thinking_ratio": float(deep_thinking_flags_t.mean().item()),
         "average_deep_thinking_settling_depth": average_deep_thinking_settling_depth,
         "self_certainty": float(token_self_certainties_t.mean().item()),
+        "normalized_confidence": float(token_normalized_confidences_t.mean().item()),
         "average_log_probability": float(token_logprobs_t.mean().item()),
         "num_response_tokens": float(num_response_tokens),
         "deep_layer_start": float(deep_start_layer),

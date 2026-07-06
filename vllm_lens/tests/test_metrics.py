@@ -8,6 +8,7 @@ import torch
 from vllm_lens.metrics import (
     jsd_from_logits,
     kl_uniform_to_probs,
+    normalized_confidence_from_logits,
     compute_intrinsic_metrics_from_activations,
     normalize_metric_options,
 )
@@ -80,6 +81,17 @@ def test_normalize_metric_options_rejects_invalid() -> None:
         normalize_metric_options("yes")
 
 
+def test_normalized_confidence_from_logits_is_bounded() -> None:
+    uniform = normalized_confidence_from_logits(torch.zeros(5))
+    peaked = normalized_confidence_from_logits(torch.tensor([100.0, -100.0, -100.0]))
+    ordinary = normalized_confidence_from_logits(torch.randn(8, 13))
+
+    assert uniform.item() == pytest.approx(0.0)
+    assert peaked.item() == pytest.approx(1.0)
+    assert bool(torch.all(ordinary >= 0.0).item())
+    assert bool(torch.all(ordinary <= 1.0).item())
+
+
 def test_compute_intrinsic_metrics_from_activations() -> None:
     lm_head = torch.nn.Linear(3, 5, bias=False)
     with torch.no_grad():
@@ -124,6 +136,7 @@ def test_compute_intrinsic_metrics_from_activations() -> None:
         "deep_thinking_ratio",
         "average_deep_thinking_settling_depth",
         "self_certainty",
+        "normalized_confidence",
         "average_log_probability",
         "num_response_tokens",
         "deep_layer_start",
@@ -269,6 +282,7 @@ def _scalar_intrinsic_metrics(
 
     token_logprobs: list[float] = []
     token_self_certainties: list[float] = []
+    token_normalized_confidences: list[float] = []
     deep_thinking_flags: list[int] = []
     deep_thinking_settling_depths: list[int] = []
 
@@ -281,6 +295,9 @@ def _scalar_intrinsic_metrics(
         final_log_probs = torch.log_softmax(final_logits.float(), dim=-1)
         token_logprobs.append(float(final_log_probs[token_id].item()))
         token_self_certainties.append(float(kl_uniform_to_probs(final_logits).item()))
+        token_normalized_confidences.append(
+            float(normalized_confidence_from_logits(final_logits).item())
+        )
 
         jsd_per_layer: list[float] = []
         for layer_idx in range(num_layers):
@@ -311,6 +328,7 @@ def _scalar_intrinsic_metrics(
             sum(deep_thinking_settling_depths) / depth_denom
         ),
         "self_certainty": float(sum(token_self_certainties) / denom),
+        "normalized_confidence": float(sum(token_normalized_confidences) / denom),
         "average_log_probability": float(sum(token_logprobs) / denom),
         "num_response_tokens": float(len(token_logprobs)),
         "deep_layer_start": float(deep_start_layer),
