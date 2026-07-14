@@ -8,72 +8,64 @@ import torch
 from vllm_lens.metrics import (
     jsd_from_logits,
     kl_uniform_to_probs,
+    normalized_jsd_from_logits,
     normalized_confidence_from_logits,
     compute_intrinsic_metrics_from_activations,
     normalize_metric_options,
+    total_variation_from_logits,
 )
 
 
-def test_normalize_metric_options_defaults() -> None:
-    assert normalize_metric_options(True) == {
+def _default_metric_options(**overrides):
+    options = {
         "jsd_threshold": 0.5,
         "deep_layer_fraction": 0.85,
         "logits_batch_size": 128,
         "metrics_storage": "cpu",
+        "revision_alpha": 0.5,
+        "revision_middle_layer": None,
+        "revision_distance": "jsd",
     }
+    options.update(overrides)
+    return options
+
+
+def test_normalize_metric_options_defaults() -> None:
+    assert normalize_metric_options(True) == _default_metric_options()
 
 
 def test_normalize_metric_options_custom() -> None:
     assert normalize_metric_options(
         {"jsd_threshold": 0.1, "deep_layer_fraction": 0.5}
-    ) == {
-        "jsd_threshold": 0.1,
-        "deep_layer_fraction": 0.5,
-        "logits_batch_size": 128,
-        "metrics_storage": "cpu",
-    }
+    ) == _default_metric_options(jsd_threshold=0.1, deep_layer_fraction=0.5)
     assert normalize_metric_options(
         {
             "jsd_threshold": 0.1,
             "deep_layer_fraction": 0.5,
             "logits_batch_size": 4,
             "metrics_storage": "gpu",
+            "revision_alpha": 0.25,
+            "revision_middle_layer": 3,
+            "revision_distance": "tv",
         }
-    ) == {
-        "jsd_threshold": 0.1,
-        "deep_layer_fraction": 0.5,
-        "logits_batch_size": 4,
-        "metrics_storage": "gpu",
-    }
+    ) == _default_metric_options(
+        jsd_threshold=0.1,
+        deep_layer_fraction=0.5,
+        logits_batch_size=4,
+        metrics_storage="gpu",
+        revision_alpha=0.25,
+        revision_middle_layer=3,
+        revision_distance="tv",
+    )
 
 
 def test_normalize_metric_options_from_openai_xargs_string() -> None:
-    assert normalize_metric_options("true") == {
-        "jsd_threshold": 0.5,
-        "deep_layer_fraction": 0.85,
-        "logits_batch_size": 128,
-        "metrics_storage": "cpu",
-    }
-    assert normalize_metric_options(["true"]) == {
-        "jsd_threshold": 0.5,
-        "deep_layer_fraction": 0.85,
-        "logits_batch_size": 128,
-        "metrics_storage": "cpu",
-    }
-    assert normalize_metric_options(1) == {
-        "jsd_threshold": 0.5,
-        "deep_layer_fraction": 0.85,
-        "logits_batch_size": 128,
-        "metrics_storage": "cpu",
-    }
+    assert normalize_metric_options("true") == _default_metric_options()
+    assert normalize_metric_options(["true"]) == _default_metric_options()
+    assert normalize_metric_options(1) == _default_metric_options()
     assert normalize_metric_options(
         '{"jsd_threshold": 0.1, "deep_layer_fraction": 0.5}'
-    ) == {
-        "jsd_threshold": 0.1,
-        "deep_layer_fraction": 0.5,
-        "logits_batch_size": 128,
-        "metrics_storage": "cpu",
-    }
+    ) == _default_metric_options(jsd_threshold=0.1, deep_layer_fraction=0.5)
 
 
 def test_normalize_metric_options_rejects_invalid() -> None:
@@ -81,6 +73,20 @@ def test_normalize_metric_options_rejects_invalid() -> None:
         normalize_metric_options("yes")
     with pytest.raises(ValueError, match="logits_batch_size"):
         normalize_metric_options({"logits_batch_size": 0})
+    with pytest.raises(ValueError, match="revision_alpha"):
+        normalize_metric_options({"revision_alpha": 0.0})
+    with pytest.raises(ValueError, match="revision_distance"):
+        normalize_metric_options({"revision_distance": "bad"})
+
+
+def test_revision_distance_helpers_are_bounded() -> None:
+    logits_a = torch.tensor([100.0, -100.0])
+    logits_b = torch.tensor([-100.0, 100.0])
+
+    assert normalized_jsd_from_logits(logits_a, logits_a).item() == pytest.approx(0.0)
+    assert normalized_jsd_from_logits(logits_a, logits_b).item() == pytest.approx(1.0)
+    assert total_variation_from_logits(logits_a, logits_a).item() == pytest.approx(0.0)
+    assert total_variation_from_logits(logits_a, logits_b).item() == pytest.approx(1.0)
 
 
 def test_normalized_confidence_from_logits_is_bounded() -> None:
@@ -142,15 +148,24 @@ def test_compute_intrinsic_metrics_from_activations() -> None:
         "normalized_confidence",
         "average_log_probability",
         "negative_perplexity",
+        "peak_change_score",
+        "ema_final_score",
+        "ema_mean_score",
         "num_response_tokens",
         "deep_layer_start",
         "num_layers",
         "jsd_threshold",
+        "revision_middle_layer",
+        "revision_alpha",
+        "revision_distance_jsd",
     }
     assert metrics["num_response_tokens"] == 2.0
     assert metrics["num_layers"] == 2.0
     assert metrics["deep_layer_start"] == 1.0
     assert metrics["jsd_threshold"] == 1.0
+    assert metrics["revision_middle_layer"] == 0.0
+    assert metrics["revision_alpha"] == 0.5
+    assert metrics["revision_distance_jsd"] == 1.0
     assert metrics["negative_perplexity"] == pytest.approx(
         math.exp(-metrics["average_log_probability"])
     )
@@ -327,14 +342,22 @@ def _scalar_intrinsic_metrics(
     jsd_threshold: float,
     deep_layer_fraction: float,
     final_logits_fn=None,
+    revision_alpha: float = 0.5,
+    revision_middle_layer: int | None = None,
+    revision_distance: str = "jsd",
 ) -> dict[str, float]:
     num_layers = residual_stream.shape[0]
     deep_start_layer = math.ceil(num_layers * deep_layer_fraction)
     deep_start_layer = max(1, min(deep_start_layer, num_layers))
+    if revision_middle_layer is None:
+        revision_middle_layer = min(num_layers // 2, num_layers - 2)
 
     token_logprobs: list[float] = []
     token_self_certainties: list[float] = []
     token_normalized_confidences: list[float] = []
+    token_peak_changes: list[float] = []
+    token_ema_finals: list[float] = []
+    token_ema_means: list[float] = []
     deep_thinking_flags: list[int] = []
     settled_deep_thinking_flags: list[int] = []
     deep_thinking_settling_depths: list[int] = []
@@ -351,6 +374,33 @@ def _scalar_intrinsic_metrics(
         token_normalized_confidences.append(
             float(normalized_confidence_from_logits(final_logits).item())
         )
+        revision_deltas: list[float] = []
+        for layer_idx in range(revision_middle_layer, num_layers - 1):
+            next_layer_idx = layer_idx + 1
+            next_logits_fn = (
+                (final_logits_fn or logits_fn)
+                if next_layer_idx == num_layers - 1
+                else logits_fn
+            )
+            layer_logits = logits_fn(residual_stream[layer_idx, prev_pos].unsqueeze(0))[
+                0
+            ]
+            next_logits = next_logits_fn(
+                residual_stream[next_layer_idx, prev_pos].unsqueeze(0)
+            )[0]
+            if revision_distance == "jsd":
+                delta = normalized_jsd_from_logits(layer_logits, next_logits)
+            else:
+                delta = total_variation_from_logits(layer_logits, next_logits)
+            revision_deltas.append(float(delta.item()))
+        ema_values = [revision_deltas[0]]
+        for delta in revision_deltas[1:]:
+            ema_values.append(
+                revision_alpha * delta + (1.0 - revision_alpha) * ema_values[-1]
+            )
+        token_peak_changes.append(max(revision_deltas))
+        token_ema_finals.append(ema_values[-1])
+        token_ema_means.append(sum(ema_values) / len(ema_values))
 
         jsd_per_layer: list[float] = []
         for layer_idx in range(num_layers):
@@ -403,10 +453,16 @@ def _scalar_intrinsic_metrics(
         "normalized_confidence": float(sum(token_normalized_confidences) / denom),
         "average_log_probability": average_log_probability,
         "negative_perplexity": math.exp(-average_log_probability),
+        "peak_change_score": float(sum(token_peak_changes) / denom),
+        "ema_final_score": float(sum(token_ema_finals) / denom),
+        "ema_mean_score": float(sum(token_ema_means) / denom),
         "num_response_tokens": float(len(token_logprobs)),
         "deep_layer_start": float(deep_start_layer),
         "num_layers": float(num_layers),
         "jsd_threshold": float(jsd_threshold),
+        "revision_middle_layer": float(revision_middle_layer),
+        "revision_alpha": float(revision_alpha),
+        "revision_distance_jsd": 1.0 if revision_distance == "jsd" else 0.0,
     }
 
 
@@ -423,6 +479,9 @@ def test_vectorized_metrics_match_scalar_reference() -> None:
         prompt_len=3,
         jsd_threshold=0.03,
         deep_layer_fraction=0.5,
+        revision_alpha=0.25,
+        revision_middle_layer=1,
+        revision_distance="tv",
     )
     actual = compute_intrinsic_metrics_from_activations(
         residual_stream,
@@ -432,6 +491,9 @@ def test_vectorized_metrics_match_scalar_reference() -> None:
         jsd_threshold=0.03,
         deep_layer_fraction=0.5,
         logits_batch_size=3,
+        revision_alpha=0.25,
+        revision_middle_layer=1,
+        revision_distance="tv",
     )
 
     assert actual == pytest.approx(expected, abs=1e-6)

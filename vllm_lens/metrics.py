@@ -35,6 +35,22 @@ def jsd_from_logits(
     return 0.5 * (kl_pm + kl_qm)
 
 
+def normalized_jsd_from_logits(
+    logits_a: torch.Tensor, logits_b: torch.Tensor, eps: float = 1e-12
+) -> torch.Tensor:
+    """Jensen-Shannon divergence normalized to [0, 1]."""
+    return jsd_from_logits(logits_a, logits_b, eps=eps) / math.log(2.0)
+
+
+def total_variation_from_logits(
+    logits_a: torch.Tensor, logits_b: torch.Tensor
+) -> torch.Tensor:
+    """Total variation distance between two vocab distributions."""
+    probs_a = F.softmax(logits_a.float(), dim=-1)
+    probs_b = F.softmax(logits_b.float(), dim=-1)
+    return 0.5 * torch.sum(torch.abs(probs_a - probs_b), dim=-1)
+
+
 def kl_uniform_to_probs(logits: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """KL(U || P) where U is uniform over the vocabulary."""
     del eps
@@ -93,11 +109,26 @@ def normalize_metric_options(options: Any | None) -> dict[str, Any]:
     if metrics_storage not in {"cpu", "gpu"}:
         raise ValueError('metrics_storage must be either "cpu" or "gpu"')
 
+    revision_alpha = float(options.get("revision_alpha", 0.5))
+    if not (0.0 < revision_alpha <= 1.0):
+        raise ValueError("revision_alpha must be in (0, 1]")
+
+    revision_distance = str(options.get("revision_distance", "jsd")).lower()
+    if revision_distance not in {"jsd", "tv"}:
+        raise ValueError('revision_distance must be either "jsd" or "tv"')
+
+    revision_middle_layer = options.get("revision_middle_layer")
+    if revision_middle_layer is not None:
+        revision_middle_layer = int(revision_middle_layer)
+
     return {
         "jsd_threshold": float(options.get("jsd_threshold", 0.5)),
         "deep_layer_fraction": float(options.get("deep_layer_fraction", 0.85)),
         "logits_batch_size": logits_batch_size,
         "metrics_storage": metrics_storage,
+        "revision_alpha": revision_alpha,
+        "revision_middle_layer": revision_middle_layer,
+        "revision_distance": revision_distance,
     }
 
 
@@ -134,6 +165,104 @@ def _response_hidden_states(
     return residual_stream.index_select(1, prev_positions.to(residual_stream.device))
 
 
+def _revision_distance_from_logits(
+    logits_a: torch.Tensor,
+    logits_b: torch.Tensor,
+    *,
+    distance: str,
+) -> torch.Tensor:
+    if distance == "jsd":
+        return normalized_jsd_from_logits(logits_a, logits_b)
+    if distance == "tv":
+        return total_variation_from_logits(logits_a, logits_b)
+    raise ValueError(f"Unsupported revision_distance: {distance}")
+
+
+def _empty_intrinsic_metrics(
+    *,
+    deep_start_layer: int,
+    num_layers: int,
+    jsd_threshold: float,
+    revision_middle_layer: int,
+    revision_alpha: float,
+    revision_distance: str,
+) -> dict[str, float]:
+    return {
+        "deep_thinking_ratio": 0.0,
+        "settled_deep_thinking_ratio": 0.0,
+        "average_deep_thinking_settling_depth": 0.0,
+        "self_certainty": 0.0,
+        "normalized_confidence": 0.0,
+        "average_log_probability": 0.0,
+        "negative_perplexity": 1.0,
+        "peak_change_score": 0.0,
+        "ema_final_score": 0.0,
+        "ema_mean_score": 0.0,
+        "num_response_tokens": 0.0,
+        "deep_layer_start": float(deep_start_layer),
+        "num_layers": float(num_layers),
+        "jsd_threshold": float(jsd_threshold),
+        "revision_middle_layer": float(revision_middle_layer),
+        "revision_alpha": float(revision_alpha),
+        "revision_distance_jsd": 1.0 if revision_distance == "jsd" else 0.0,
+    }
+
+
+def _compute_revision_scores_from_hidden_states(
+    response_hidden: torch.Tensor,
+    logits_fn: Callable[[torch.Tensor], torch.Tensor],
+    final_logits_fn: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    middle_layer: int,
+    alpha: float,
+    distance: str,
+    logits_device: torch.device,
+    logits_batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_layers, num_response_tokens, _ = response_hidden.shape
+    if not (0 <= middle_layer < num_layers - 1):
+        raise ValueError(
+            "revision_middle_layer must satisfy "
+            f"0 <= revision_middle_layer < num_layers-1; got {middle_layer}"
+        )
+
+    num_steps = num_layers - middle_layer - 1
+    deltas = torch.empty(
+        (num_steps, num_response_tokens), dtype=torch.float32, device=logits_device
+    )
+    for step, layer_idx in enumerate(range(middle_layer, num_layers - 1)):
+        next_layer_idx = layer_idx + 1
+        current_logits_fn = logits_fn
+        next_logits_fn = (
+            final_logits_fn if next_layer_idx == num_layers - 1 else logits_fn
+        )
+        for start in range(0, num_response_tokens, logits_batch_size):
+            end = min(start + logits_batch_size, num_response_tokens)
+            current_hidden = response_hidden[layer_idx, start:end].to(
+                device=logits_device
+            )
+            next_hidden = response_hidden[next_layer_idx, start:end].to(
+                device=logits_device
+            )
+            current_logits = current_logits_fn(current_hidden)
+            next_logits = next_logits_fn(next_hidden)
+            if current_logits.dim() == 1:
+                current_logits = current_logits.unsqueeze(0)
+            if next_logits.dim() == 1:
+                next_logits = next_logits.unsqueeze(0)
+            deltas[step, start:end] = _revision_distance_from_logits(
+                current_logits, next_logits, distance=distance
+            )
+
+    token_peak_change = torch.max(deltas, dim=0).values
+    ema = torch.empty_like(deltas)
+    ema[0] = deltas[0]
+    for step in range(1, num_steps):
+        ema[step] = alpha * deltas[step] + (1.0 - alpha) * ema[step - 1]
+
+    return token_peak_change, ema[-1], ema.mean(dim=0)
+
+
 @torch.no_grad()
 def compute_intrinsic_metrics_from_activations(
     residual_stream: torch.Tensor,
@@ -148,6 +277,9 @@ def compute_intrinsic_metrics_from_activations(
     logits_batch_size: int = 128,
     response_positions_only: bool = False,
     metrics_storage: str | None = None,
+    revision_alpha: float = 0.5,
+    revision_middle_layer: int | None = None,
+    revision_distance: str = "jsd",
 ) -> dict[str, float]:
     """Compute DTR, self-certainty, log-probability, and perplexity metrics.
 
@@ -168,9 +300,24 @@ def compute_intrinsic_metrics_from_activations(
 
     if logits_batch_size <= 0:
         raise ValueError("logits_batch_size must be positive")
+    if not (0.0 < revision_alpha <= 1.0):
+        raise ValueError("revision_alpha must be in (0, 1]")
+    revision_distance = revision_distance.lower()
+    if revision_distance not in {"jsd", "tv"}:
+        raise ValueError('revision_distance must be either "jsd" or "tv"')
     del metrics_storage
 
     num_layers, _, _ = residual_stream.shape
+    if num_layers < 2:
+        raise ValueError("Need at least two layers to compute intrinsic metrics.")
+    if revision_middle_layer is None:
+        revision_middle_layer = min(num_layers // 2, num_layers - 2)
+    if not (0 <= revision_middle_layer < num_layers - 1):
+        raise ValueError(
+            "revision_middle_layer must satisfy "
+            f"0 <= revision_middle_layer < num_layers-1; got {revision_middle_layer}"
+        )
+
     response_hidden = _response_hidden_states(
         residual_stream,
         full_token_ids,
@@ -183,19 +330,14 @@ def compute_intrinsic_metrics_from_activations(
     deep_start_layer = max(1, min(deep_start_layer, num_layers))
 
     if num_response_tokens == 0:
-        return {
-            "deep_thinking_ratio": 0.0,
-            "settled_deep_thinking_ratio": 0.0,
-            "average_deep_thinking_settling_depth": 0.0,
-            "self_certainty": 0.0,
-            "normalized_confidence": 0.0,
-            "average_log_probability": 0.0,
-            "negative_perplexity": 1.0,
-            "num_response_tokens": 0.0,
-            "deep_layer_start": float(deep_start_layer),
-            "num_layers": float(num_layers),
-            "jsd_threshold": float(jsd_threshold),
-        }
+        return _empty_intrinsic_metrics(
+            deep_start_layer=deep_start_layer,
+            num_layers=num_layers,
+            jsd_threshold=jsd_threshold,
+            revision_middle_layer=revision_middle_layer,
+            revision_alpha=revision_alpha,
+            revision_distance=revision_distance,
+        )
 
     device = logits_device or residual_stream.device
     response_token_ids = torch.tensor(
@@ -221,6 +363,20 @@ def compute_intrinsic_metrics_from_activations(
     negative_perplexity = torch.exp(-average_log_probability)
     token_self_certainties_t = kl_uniform_to_probs(final_logits)
     token_normalized_confidences_t = normalized_confidence_from_logits(final_logits)
+    (
+        token_peak_change_t,
+        token_ema_final_t,
+        token_ema_mean_t,
+    ) = _compute_revision_scores_from_hidden_states(
+        response_hidden,
+        logits_fn,
+        final_logits_fn_resolved,
+        middle_layer=revision_middle_layer,
+        alpha=revision_alpha,
+        distance=revision_distance,
+        logits_device=device,
+        logits_batch_size=logits_batch_size,
+    )
 
     jsd_per_layer = torch.empty(
         (num_layers, num_response_tokens), dtype=torch.float32, device=device
@@ -288,8 +444,14 @@ def compute_intrinsic_metrics_from_activations(
         "normalized_confidence": float(token_normalized_confidences_t.mean().item()),
         "average_log_probability": float(average_log_probability.item()),
         "negative_perplexity": float(negative_perplexity.item()),
+        "peak_change_score": float(token_peak_change_t.mean().item()),
+        "ema_final_score": float(token_ema_final_t.mean().item()),
+        "ema_mean_score": float(token_ema_mean_t.mean().item()),
         "num_response_tokens": float(num_response_tokens),
         "deep_layer_start": float(deep_start_layer),
         "num_layers": float(num_layers),
         "jsd_threshold": float(jsd_threshold),
+        "revision_middle_layer": float(revision_middle_layer),
+        "revision_alpha": float(revision_alpha),
+        "revision_distance_jsd": 1.0 if revision_distance == "jsd" else 0.0,
     }

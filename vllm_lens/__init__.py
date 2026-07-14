@@ -10,6 +10,8 @@ from vllm_lens._helpers.types import SteeringVector
 from vllm_lens.metrics import (
     compute_intrinsic_metrics_from_activations,
     normalize_metric_options,
+    normalized_jsd_from_logits,
+    total_variation_from_logits,
 )
 
 try:
@@ -25,5 +27,7 @@ __all__ = [
     "SteeringVector",
     "compute_intrinsic_metrics_from_activations",
     "normalize_metric_options",
+    "normalized_jsd_from_logits",
+    "total_variation_from_logits",
     "__version__",
 ]
