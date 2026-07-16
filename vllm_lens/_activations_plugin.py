@@ -425,7 +425,9 @@ def register() -> None:
     Use ``extra_args={"output_residual_stream": True | list[int]}`` in
     SamplingParams to request activations. Use
     ``extra_args={"output_intrinsic_metrics": True}`` to request metrics
-    computed from all residual-stream layers.
+    computed from all residual-stream layers, or set
+    ``output_intrinsic_metrics`` to
+    ``{"return_token_self_certainties": True}`` to include per-token values.
     """
     global _original_create_engine_config
     global _original_generate, _original_llm_generate

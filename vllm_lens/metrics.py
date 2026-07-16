@@ -129,6 +129,9 @@ def normalize_metric_options(options: Any | None) -> dict[str, Any]:
         "revision_alpha": revision_alpha,
         "revision_middle_layer": revision_middle_layer,
         "revision_distance": revision_distance,
+        "return_token_self_certainties": bool(
+            options.get("return_token_self_certainties", False)
+        ),
     }
 
 
@@ -186,8 +189,9 @@ def _empty_intrinsic_metrics(
     revision_middle_layer: int,
     revision_alpha: float,
     revision_distance: str,
-) -> dict[str, float]:
-    return {
+    return_token_self_certainties: bool,
+) -> dict[str, float | list[float]]:
+    metrics: dict[str, float | list[float]] = {
         "deep_thinking_ratio": 0.0,
         "settled_deep_thinking_ratio": 0.0,
         "average_deep_thinking_settling_depth": 0.0,
@@ -206,6 +210,9 @@ def _empty_intrinsic_metrics(
         "revision_alpha": float(revision_alpha),
         "revision_distance_jsd": 1.0 if revision_distance == "jsd" else 0.0,
     }
+    if return_token_self_certainties:
+        metrics["token_self_certainties"] = []
+    return metrics
 
 
 def _compute_revision_scores_from_hidden_states(
@@ -280,7 +287,8 @@ def compute_intrinsic_metrics_from_activations(
     revision_alpha: float = 0.5,
     revision_middle_layer: int | None = None,
     revision_distance: str = "jsd",
-) -> dict[str, float]:
+    return_token_self_certainties: bool = False,
+) -> dict[str, float | list[float]]:
     """Compute DTR, self-certainty, log-probability, and perplexity metrics.
 
     Args:
@@ -337,6 +345,7 @@ def compute_intrinsic_metrics_from_activations(
             revision_middle_layer=revision_middle_layer,
             revision_alpha=revision_alpha,
             revision_distance=revision_distance,
+            return_token_self_certainties=return_token_self_certainties,
         )
 
     device = logits_device or residual_stream.device
@@ -436,7 +445,7 @@ def compute_intrinsic_metrics_from_activations(
         else 0.0
     )
 
-    return {
+    metrics: dict[str, float | list[float]] = {
         "deep_thinking_ratio": float(deep_thinking_flags_t.mean().item()),
         "settled_deep_thinking_ratio": settled_deep_thinking_ratio,
         "average_deep_thinking_settling_depth": average_deep_thinking_settling_depth,
@@ -455,3 +464,6 @@ def compute_intrinsic_metrics_from_activations(
         "revision_alpha": float(revision_alpha),
         "revision_distance_jsd": 1.0 if revision_distance == "jsd" else 0.0,
     }
+    if return_token_self_certainties:
+        metrics["token_self_certainties"] = token_self_certainties_t.tolist()
+    return metrics

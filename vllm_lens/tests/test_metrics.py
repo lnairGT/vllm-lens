@@ -25,6 +25,7 @@ def _default_metric_options(**overrides):
         "revision_alpha": 0.5,
         "revision_middle_layer": None,
         "revision_distance": "jsd",
+        "return_token_self_certainties": False,
     }
     options.update(overrides)
     return options
@@ -47,6 +48,7 @@ def test_normalize_metric_options_custom() -> None:
             "revision_alpha": 0.25,
             "revision_middle_layer": 3,
             "revision_distance": "tv",
+            "return_token_self_certainties": True,
         }
     ) == _default_metric_options(
         jsd_threshold=0.1,
@@ -56,6 +58,7 @@ def test_normalize_metric_options_custom() -> None:
         revision_alpha=0.25,
         revision_middle_layer=3,
         revision_distance="tv",
+        return_token_self_certainties=True,
     )
 
 
@@ -66,6 +69,9 @@ def test_normalize_metric_options_from_openai_xargs_string() -> None:
     assert normalize_metric_options(
         '{"jsd_threshold": 0.1, "deep_layer_fraction": 0.5}'
     ) == _default_metric_options(jsd_threshold=0.1, deep_layer_fraction=0.5)
+    assert normalize_metric_options(
+        '{"return_token_self_certainties": true}'
+    ) == _default_metric_options(return_token_self_certainties=True)
 
 
 def test_normalize_metric_options_rejects_invalid() -> None:
@@ -170,6 +176,37 @@ def test_compute_intrinsic_metrics_from_activations() -> None:
         math.exp(-metrics["average_log_probability"])
     )
     assert all(math.isfinite(v) for v in metrics.values())
+
+
+def test_compute_intrinsic_metrics_can_return_token_self_certainties() -> None:
+    lm_head = torch.nn.Linear(2, 3, bias=False)
+    residual_stream = torch.randn(2, 3, 2)
+
+    metrics = compute_intrinsic_metrics_from_activations(
+        residual_stream,
+        lm_head,
+        full_token_ids=[0, 1, 2],
+        prompt_len=1,
+        return_token_self_certainties=True,
+    )
+
+    token_values = metrics["token_self_certainties"]
+    assert isinstance(token_values, list)
+    assert len(token_values) == 2
+    assert all(math.isfinite(value) for value in token_values)
+    assert metrics["self_certainty"] == pytest.approx(sum(token_values) / 2)
+
+
+def test_empty_intrinsic_metrics_can_return_token_self_certainties() -> None:
+    metrics = compute_intrinsic_metrics_from_activations(
+        torch.empty(2, 0, 2),
+        torch.nn.Linear(2, 3, bias=False),
+        full_token_ids=[0],
+        prompt_len=1,
+        return_token_self_certainties=True,
+    )
+
+    assert metrics["token_self_certainties"] == []
 
 
 def test_compute_intrinsic_metrics_uses_final_logits_fn_for_targets() -> None:
