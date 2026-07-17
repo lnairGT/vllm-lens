@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 from vllm_lens.metrics import (
     compute_intrinsic_metrics_from_activations,
     normalize_metric_options,
+    required_metric_layers,
 )
 from vllm_lens._helpers.types import SteeringVector
 
@@ -412,7 +413,19 @@ def _hook_inner(
                 if rel_indices.numel() == 0:
                     continue
                 metric_options = normalize_metric_options(output_intrinsic_metrics)
-                metric_activation = hidden_states[start:end].index_select(0, rel_indices)
+                metric_layers = required_metric_layers(
+                    len(_get_layers(runner.model)),
+                    metric_options["metrics"],
+                    metric_options["revision_middle_layer"],
+                    return_token_self_certainties=metric_options[
+                        "return_token_self_certainties"
+                    ],
+                )
+                if layer_idx not in metric_layers:
+                    continue
+                metric_activation = hidden_states[start:end].index_select(
+                    0, rel_indices
+                )
                 if metric_options["metrics_storage"] == "gpu":
                     metric_activation = metric_activation.detach().clone()
                 else:
@@ -646,11 +659,20 @@ class HiddenStatesExtension:
                 return None
 
             total_layers = len(_get_layers(self.model_runner.model))
-            if sorted_indices != list(range(total_layers)):
+            metric_options = normalize_metric_options(options)
+            expected_indices = required_metric_layers(
+                total_layers,
+                metric_options["metrics"],
+                metric_options["revision_middle_layer"],
+                return_token_self_certainties=metric_options[
+                    "return_token_self_certainties"
+                ],
+            )
+            if sorted_indices != expected_indices:
                 logger.warning(
-                    "Intrinsic metrics require all decoder layers; got %s of %d",
+                    "Intrinsic metrics require decoder layers %s; got %s",
+                    expected_indices,
                     sorted_indices,
-                    total_layers,
                 )
                 return None
 
@@ -661,7 +683,6 @@ class HiddenStatesExtension:
                 torch.stack(per_layer, dim=0)
             )
 
-            metric_options = normalize_metric_options(options)
             metric_options["response_positions_only"] = True
             metrics = compute_intrinsic_metrics_from_activations(
                 residual_stream,
@@ -670,6 +691,8 @@ class HiddenStatesExtension:
                 prompt_len,
                 logits_device=next(self.model_runner.model.parameters()).device,
                 final_logits_fn=_get_final_logits_fn(self.model_runner.model),
+                layer_indices=sorted_indices,
+                num_model_layers=total_layers,
                 **metric_options,
             )
             self._metric_states.pop(req_id, None)

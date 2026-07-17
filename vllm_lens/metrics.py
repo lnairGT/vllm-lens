@@ -19,6 +19,64 @@ import torch
 import torch.nn.functional as F
 
 
+FINAL_METRICS = {
+    "average_log_probability",
+    "negative_perplexity",
+    "normalized_confidence",
+    "self_certainty",
+}
+DEEP_THINKING_METRICS = {
+    "average_deep_thinking_settling_depth",
+    "deep_thinking_ratio",
+    "settled_deep_thinking_ratio",
+}
+REVISION_METRICS = {"ema_final_score", "ema_mean_score", "peak_change_score"}
+ALL_METRICS = FINAL_METRICS | DEEP_THINKING_METRICS | REVISION_METRICS
+
+
+def normalize_metric_names(metrics: Any | None) -> list[str]:
+    if not metrics:
+        return ["self_certainty"]
+    if not isinstance(metrics, (list, tuple)) or not all(
+        isinstance(metric, str) for metric in metrics
+    ):
+        raise TypeError("metrics must be a list of metric names")
+    if "all" in metrics:
+        if len(metrics) != 1:
+            raise ValueError('"all" cannot be combined with other metrics')
+        return sorted(ALL_METRICS)
+    unknown = set(metrics) - ALL_METRICS
+    if unknown:
+        raise ValueError(f"Unknown metrics: {', '.join(sorted(unknown))}")
+    return list(dict.fromkeys(metrics))
+
+
+def required_metric_layers(
+    total_layers: int,
+    metrics: list[str],
+    revision_middle_layer: int | None,
+    *,
+    return_token_self_certainties: bool,
+) -> list[int]:
+    selected = set(metrics)
+    layers = {total_layers - 1}
+    if selected & DEEP_THINKING_METRICS:
+        layers.update(range(total_layers))
+    if selected & REVISION_METRICS:
+        middle = revision_middle_layer
+        if middle is None:
+            middle = min(total_layers // 2, total_layers - 2)
+        if not (0 <= middle < total_layers - 1):
+            raise ValueError(
+                "revision_middle_layer must satisfy "
+                f"0 <= revision_middle_layer < num_layers-1; got {middle}"
+            )
+        layers.update(range(middle, total_layers))
+    if not selected and not return_token_self_certainties:
+        return []
+    return sorted(layers)
+
+
 def jsd_from_logits(
     logits_a: torch.Tensor, logits_b: torch.Tensor, eps: float = 1e-12
 ) -> torch.Tensor:
@@ -56,9 +114,7 @@ def kl_uniform_to_probs(logits: torch.Tensor, eps: float = 1e-12) -> torch.Tenso
     del eps
     log_p = F.log_softmax(logits.float(), dim=-1)
     vocab_size = logits.shape[-1]
-    u = 1.0 / vocab_size
-    log_u = math.log(u)
-    return torch.sum(torch.full_like(log_p, u) * (log_u - log_p), dim=-1)
+    return -math.log(vocab_size) - log_p.mean(dim=-1)
 
 
 def normalized_confidence_from_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -121,7 +177,10 @@ def normalize_metric_options(options: Any | None) -> dict[str, Any]:
     if revision_middle_layer is not None:
         revision_middle_layer = int(revision_middle_layer)
 
+    metrics = normalize_metric_names(options.get("metrics"))
+
     return {
+        "metrics": metrics,
         "jsd_threshold": float(options.get("jsd_threshold", 0.5)),
         "deep_layer_fraction": float(options.get("deep_layer_fraction", 0.85)),
         "logits_batch_size": logits_batch_size,
@@ -179,40 +238,6 @@ def _revision_distance_from_logits(
     if distance == "tv":
         return total_variation_from_logits(logits_a, logits_b)
     raise ValueError(f"Unsupported revision_distance: {distance}")
-
-
-def _empty_intrinsic_metrics(
-    *,
-    deep_start_layer: int,
-    num_layers: int,
-    jsd_threshold: float,
-    revision_middle_layer: int,
-    revision_alpha: float,
-    revision_distance: str,
-    return_token_self_certainties: bool,
-) -> dict[str, float | list[float]]:
-    metrics: dict[str, float | list[float]] = {
-        "deep_thinking_ratio": 0.0,
-        "settled_deep_thinking_ratio": 0.0,
-        "average_deep_thinking_settling_depth": 0.0,
-        "self_certainty": 0.0,
-        "normalized_confidence": 0.0,
-        "average_log_probability": 0.0,
-        "negative_perplexity": 1.0,
-        "peak_change_score": 0.0,
-        "ema_final_score": 0.0,
-        "ema_mean_score": 0.0,
-        "num_response_tokens": 0.0,
-        "deep_layer_start": float(deep_start_layer),
-        "num_layers": float(num_layers),
-        "jsd_threshold": float(jsd_threshold),
-        "revision_middle_layer": float(revision_middle_layer),
-        "revision_alpha": float(revision_alpha),
-        "revision_distance_jsd": 1.0 if revision_distance == "jsd" else 0.0,
-    }
-    if return_token_self_certainties:
-        metrics["token_self_certainties"] = []
-    return metrics
 
 
 def _compute_revision_scores_from_hidden_states(
@@ -288,8 +313,11 @@ def compute_intrinsic_metrics_from_activations(
     revision_middle_layer: int | None = None,
     revision_distance: str = "jsd",
     return_token_self_certainties: bool = False,
+    metrics: list[str] | None = None,
+    layer_indices: list[int] | None = None,
+    num_model_layers: int | None = None,
 ) -> dict[str, float | list[float]]:
-    """Compute DTR, self-certainty, log-probability, and perplexity metrics.
+    """Compute selected intrinsic metrics from the required residual layers.
 
     Args:
         residual_stream: Tensor with shape ``(n_layers, seq_len, hidden_dim)``.
@@ -315,16 +343,26 @@ def compute_intrinsic_metrics_from_activations(
         raise ValueError('revision_distance must be either "jsd" or "tv"')
     del metrics_storage
 
-    num_layers, _, _ = residual_stream.shape
-    if num_layers < 2:
-        raise ValueError("Need at least two layers to compute intrinsic metrics.")
+    captured_layers, _, _ = residual_stream.shape
+    if layer_indices is None:
+        layer_indices = list(range(captured_layers))
+    if len(layer_indices) != captured_layers:
+        raise ValueError("layer_indices must match residual_stream's first dimension")
+    num_layers = num_model_layers or (max(layer_indices) + 1)
+    selected_metrics = set(normalize_metric_names(metrics))
+    required_layers = required_metric_layers(
+        num_layers,
+        list(selected_metrics),
+        revision_middle_layer,
+        return_token_self_certainties=return_token_self_certainties,
+    )
+    missing_layers = set(required_layers) - set(layer_indices)
+    if missing_layers:
+        raise ValueError(
+            f"Selected metrics require decoder layers {required_layers}; got {layer_indices}"
+        )
     if revision_middle_layer is None:
         revision_middle_layer = min(num_layers // 2, num_layers - 2)
-    if not (0 <= revision_middle_layer < num_layers - 1):
-        raise ValueError(
-            "revision_middle_layer must satisfy "
-            f"0 <= revision_middle_layer < num_layers-1; got {revision_middle_layer}"
-        )
 
     response_hidden = _response_hidden_states(
         residual_stream,
@@ -337,125 +375,11 @@ def compute_intrinsic_metrics_from_activations(
     deep_start_layer = math.ceil(num_layers * deep_layer_fraction)
     deep_start_layer = max(1, min(deep_start_layer, num_layers))
 
-    if num_response_tokens == 0:
-        return _empty_intrinsic_metrics(
-            deep_start_layer=deep_start_layer,
-            num_layers=num_layers,
-            jsd_threshold=jsd_threshold,
-            revision_middle_layer=revision_middle_layer,
-            revision_alpha=revision_alpha,
-            revision_distance=revision_distance,
-            return_token_self_certainties=return_token_self_certainties,
-        )
-
     device = logits_device or residual_stream.device
     response_token_ids = torch.tensor(
         full_token_ids[prompt_len:], dtype=torch.long, device=device
     )
-
-    final_logits_fn_resolved = final_logits_fn or logits_fn
-    final_hidden = response_hidden[-1].to(device=device)
-    final_logits = final_logits_fn_resolved(final_hidden)
-    if final_logits.dim() == 1:
-        final_logits = final_logits.unsqueeze(0)
-    vocab_size = final_logits.shape[-1]
-    too_large = response_token_ids >= vocab_size
-    if bool(torch.any(too_large).item()):
-        token_id = int(response_token_ids[too_large][0].item())
-        raise ValueError(
-            f"token_id {token_id} is outside output vocab size {vocab_size}"
-        )
-
-    final_log_probs = F.log_softmax(final_logits.float(), dim=-1)
-    token_logprobs_t = final_log_probs.gather(1, response_token_ids[:, None]).squeeze(1)
-    average_log_probability = token_logprobs_t.mean()
-    negative_perplexity = torch.exp(-average_log_probability)
-    token_self_certainties_t = kl_uniform_to_probs(final_logits)
-    token_normalized_confidences_t = normalized_confidence_from_logits(final_logits)
-    (
-        token_peak_change_t,
-        token_ema_final_t,
-        token_ema_mean_t,
-    ) = _compute_revision_scores_from_hidden_states(
-        response_hidden,
-        logits_fn,
-        final_logits_fn_resolved,
-        middle_layer=revision_middle_layer,
-        alpha=revision_alpha,
-        distance=revision_distance,
-        logits_device=device,
-        logits_batch_size=logits_batch_size,
-    )
-
-    jsd_per_layer = torch.empty(
-        (num_layers, num_response_tokens), dtype=torch.float32, device=device
-    )
-    for layer_idx in range(num_layers):
-        layer_hidden_all = response_hidden[layer_idx]
-        layer_logits_fn = (
-            final_logits_fn_resolved if layer_idx == num_layers - 1 else logits_fn
-        )
-        for start in range(0, num_response_tokens, logits_batch_size):
-            end = min(start + logits_batch_size, num_response_tokens)
-            hidden = layer_hidden_all[start:end].to(device=device)
-            layer_logits = layer_logits_fn(hidden)
-            if layer_logits.dim() == 1:
-                layer_logits = layer_logits.unsqueeze(0)
-            expanded_final = final_logits[start:end]
-            jsd_per_layer[layer_idx, start:end] = jsd_from_logits(
-                layer_logits, expanded_final
-            )
-
-    running_min_jsd = torch.cummin(jsd_per_layer, dim=0).values
-    below_threshold = running_min_jsd <= jsd_threshold
-    first_below = below_threshold.float().argmax(dim=0) + 1
-    has_below = below_threshold.any(dim=0)
-    settling_depth = torch.where(
-        has_below,
-        first_below,
-        torch.full_like(first_below, num_layers),
-    )
-    deep_thinking_flags_t = (settling_depth >= deep_start_layer).float()
-    deep_thinking_depths = settling_depth[deep_thinking_flags_t.bool()].float()
-    average_deep_thinking_settling_depth = (
-        float(deep_thinking_depths.mean().item())
-        if deep_thinking_depths.numel()
-        else 0.0
-    )
-
-    settled_below_threshold = jsd_per_layer <= jsd_threshold
-    settled_from_layer = (
-        torch.cumprod(settled_below_threshold.flip(0).int(), dim=0).flip(0).bool()
-    )
-    first_settled = settled_from_layer.float().argmax(dim=0) + 1
-    has_settled = settled_from_layer.any(dim=0)
-    settled_depth = torch.where(
-        has_settled,
-        first_settled,
-        torch.full_like(first_settled, num_layers),
-    )
-    deep_thinking_mask = deep_thinking_flags_t.bool()
-    settled_deep_thinking_count = (
-        ((settled_depth <= settling_depth) & deep_thinking_mask).float().sum()
-    )
-    deep_thinking_count = deep_thinking_flags_t.sum()
-    settled_deep_thinking_ratio = (
-        float((settled_deep_thinking_count / deep_thinking_count).item())
-        if float(deep_thinking_count.item()) > 0.0
-        else 0.0
-    )
-
-    metrics: dict[str, float | list[float]] = {
-        "deep_thinking_ratio": float(deep_thinking_flags_t.mean().item()),
-        "settled_deep_thinking_ratio": settled_deep_thinking_ratio,
-        "average_deep_thinking_settling_depth": average_deep_thinking_settling_depth,
-        "self_certainty": float(token_self_certainties_t.mean().item()),
-        "normalized_confidence": float(token_normalized_confidences_t.mean().item()),
-        "average_log_probability": float(average_log_probability.item()),
-        "negative_perplexity": float(negative_perplexity.item()),
-        "peak_change_score": float(token_peak_change_t.mean().item()),
-        "ema_final_score": float(token_ema_final_t.mean().item()),
-        "ema_mean_score": float(token_ema_mean_t.mean().item()),
+    metadata = {
         "num_response_tokens": float(num_response_tokens),
         "deep_layer_start": float(deep_start_layer),
         "num_layers": float(num_layers),
@@ -464,6 +388,178 @@ def compute_intrinsic_metrics_from_activations(
         "revision_alpha": float(revision_alpha),
         "revision_distance_jsd": 1.0 if revision_distance == "jsd" else 0.0,
     }
+    if num_response_tokens == 0:
+        empty = {
+            metric: 1.0 if metric == "negative_perplexity" else 0.0
+            for metric in selected_metrics
+        }
+        if return_token_self_certainties:
+            empty["token_self_certainties"] = []
+        return empty | metadata
+
+    wants_deep_thinking = bool(selected_metrics & DEEP_THINKING_METRICS)
+    wants_revision = bool(selected_metrics & REVISION_METRICS)
+    wants_logprobs = bool(
+        selected_metrics & {"average_log_probability", "negative_perplexity"}
+    )
+    wants_self_certainty = (
+        "self_certainty" in selected_metrics or return_token_self_certainties
+    )
+    wants_normalized_confidence = "normalized_confidence" in selected_metrics
+    row_for_layer = {layer: row for row, layer in enumerate(layer_indices)}
+    final_row = row_for_layer[num_layers - 1]
+    final_logits_fn_resolved = final_logits_fn or logits_fn
+    token_logprobs_t = (
+        torch.empty(num_response_tokens, dtype=torch.float32, device=device)
+        if wants_logprobs
+        else None
+    )
+    token_self_certainties_t = (
+        torch.empty(num_response_tokens, dtype=torch.float32, device=device)
+        if wants_self_certainty
+        else None
+    )
+    token_normalized_confidences_t = (
+        torch.empty(num_response_tokens, dtype=torch.float32, device=device)
+        if wants_normalized_confidence
+        else None
+    )
+    jsd_per_layer = (
+        torch.empty(
+            (num_layers, num_response_tokens), dtype=torch.float32, device=device
+        )
+        if wants_deep_thinking
+        else None
+    )
+    for start in range(0, num_response_tokens, logits_batch_size):
+        end = min(start + logits_batch_size, num_response_tokens)
+        final_hidden = response_hidden[final_row, start:end].to(device=device)
+        final_logits = final_logits_fn_resolved(final_hidden)
+        if final_logits.dim() == 1:
+            final_logits = final_logits.unsqueeze(0)
+        vocab_size = final_logits.shape[-1]
+        batch_token_ids = response_token_ids[start:end]
+        if wants_logprobs or wants_self_certainty or wants_normalized_confidence:
+            final_log_probs = F.log_softmax(final_logits.float(), dim=-1)
+            if wants_logprobs:
+                too_large = batch_token_ids >= vocab_size
+                if bool(torch.any(too_large).item()):
+                    token_id = int(batch_token_ids[too_large][0].item())
+                    raise ValueError(
+                        f"token_id {token_id} is outside output vocab size {vocab_size}"
+                    )
+                assert token_logprobs_t is not None
+                token_logprobs_t[start:end] = final_log_probs.gather(
+                    1, batch_token_ids[:, None]
+                ).squeeze(1)
+            if wants_self_certainty:
+                assert token_self_certainties_t is not None
+                token_self_certainties_t[start:end] = -math.log(
+                    vocab_size
+                ) - final_log_probs.mean(dim=-1)
+            if wants_normalized_confidence:
+                assert token_normalized_confidences_t is not None
+                final_probs = final_log_probs.exp()
+                token_normalized_confidences_t[start:end] = 1.0 - (
+                    -(final_probs * final_log_probs).sum(dim=-1) / math.log(vocab_size)
+                )
+
+        if jsd_per_layer is not None:
+            for layer_idx in range(num_layers - 1):
+                hidden = response_hidden[row_for_layer[layer_idx], start:end].to(
+                    device=device
+                )
+                layer_logits = logits_fn(hidden)
+                if layer_logits.dim() == 1:
+                    layer_logits = layer_logits.unsqueeze(0)
+                jsd_per_layer[layer_idx, start:end] = jsd_from_logits(
+                    layer_logits, final_logits
+                )
+            jsd_per_layer[-1, start:end] = 0.0
+
+    metric_values: dict[str, float | list[float]] = {}
+    if token_logprobs_t is not None:
+        average_log_probability = token_logprobs_t.mean()
+        metric_values["average_log_probability"] = float(average_log_probability.item())
+        metric_values["negative_perplexity"] = float(
+            torch.exp(-average_log_probability).item()
+        )
+    if token_self_certainties_t is not None:
+        metric_values["self_certainty"] = float(token_self_certainties_t.mean().item())
+    if token_normalized_confidences_t is not None:
+        metric_values["normalized_confidence"] = float(
+            token_normalized_confidences_t.mean().item()
+        )
+
+    if wants_revision:
+        revision_rows = [
+            row_for_layer[layer] for layer in range(revision_middle_layer, num_layers)
+        ]
+        revision_hidden = response_hidden[revision_rows]
+        (
+            token_peak_change_t,
+            token_ema_final_t,
+            token_ema_mean_t,
+        ) = _compute_revision_scores_from_hidden_states(
+            revision_hidden,
+            logits_fn,
+            final_logits_fn_resolved,
+            middle_layer=0,
+            alpha=revision_alpha,
+            distance=revision_distance,
+            logits_device=device,
+            logits_batch_size=logits_batch_size,
+        )
+        metric_values.update(
+            peak_change_score=float(token_peak_change_t.mean().item()),
+            ema_final_score=float(token_ema_final_t.mean().item()),
+            ema_mean_score=float(token_ema_mean_t.mean().item()),
+        )
+
+    if jsd_per_layer is not None:
+        running_min_jsd = torch.cummin(jsd_per_layer, dim=0).values
+        below_threshold = running_min_jsd <= jsd_threshold
+        first_below = below_threshold.float().argmax(dim=0) + 1
+        has_below = below_threshold.any(dim=0)
+        settling_depth = torch.where(
+            has_below,
+            first_below,
+            torch.full_like(first_below, num_layers),
+        )
+        deep_thinking_flags_t = (settling_depth >= deep_start_layer).float()
+        deep_thinking_depths = settling_depth[deep_thinking_flags_t.bool()].float()
+        average_depth = (
+            float(deep_thinking_depths.mean().item())
+            if deep_thinking_depths.numel()
+            else 0.0
+        )
+        settled_below_threshold = jsd_per_layer <= jsd_threshold
+        settled_from_layer = (
+            torch.cumprod(settled_below_threshold.flip(0).int(), dim=0).flip(0).bool()
+        )
+        first_settled = settled_from_layer.float().argmax(dim=0) + 1
+        has_settled = settled_from_layer.any(dim=0)
+        settled_depth = torch.where(
+            has_settled,
+            first_settled,
+            torch.full_like(first_settled, num_layers),
+        )
+        deep_mask = deep_thinking_flags_t.bool()
+        settled_count = ((settled_depth <= settling_depth) & deep_mask).float().sum()
+        deep_count = deep_thinking_flags_t.sum()
+        settled_ratio = (
+            float((settled_count / deep_count).item())
+            if float(deep_count.item()) > 0.0
+            else 0.0
+        )
+        metric_values.update(
+            deep_thinking_ratio=float(deep_thinking_flags_t.mean().item()),
+            settled_deep_thinking_ratio=settled_ratio,
+            average_deep_thinking_settling_depth=average_depth,
+        )
+
+    result = {metric: metric_values[metric] for metric in selected_metrics}
     if return_token_self_certainties:
-        metrics["token_self_certainties"] = token_self_certainties_t.tolist()
-    return metrics
+        assert token_self_certainties_t is not None
+        result["token_self_certainties"] = token_self_certainties_t.tolist()
+    return result | metadata

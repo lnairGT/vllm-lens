@@ -12,12 +12,14 @@ from vllm_lens.metrics import (
     normalized_confidence_from_logits,
     compute_intrinsic_metrics_from_activations,
     normalize_metric_options,
+    required_metric_layers,
     total_variation_from_logits,
 )
 
 
 def _default_metric_options(**overrides):
     options = {
+        "metrics": ["self_certainty"],
         "jsd_threshold": 0.5,
         "deep_layer_fraction": 0.85,
         "logits_batch_size": 128,
@@ -83,6 +85,34 @@ def test_normalize_metric_options_rejects_invalid() -> None:
         normalize_metric_options({"revision_alpha": 0.0})
     with pytest.raises(ValueError, match="revision_distance"):
         normalize_metric_options({"revision_distance": "bad"})
+    with pytest.raises(ValueError, match="Unknown metrics"):
+        normalize_metric_options({"metrics": ["unknown"]})
+
+
+def test_metric_selection_captures_only_required_layers() -> None:
+    assert required_metric_layers(
+        32, ["self_certainty"], None, return_token_self_certainties=False
+    ) == [31]
+    assert required_metric_layers(
+        32, ["peak_change_score"], 20, return_token_self_certainties=False
+    ) == list(range(20, 32))
+    assert required_metric_layers(
+        32, ["deep_thinking_ratio"], None, return_token_self_certainties=False
+    ) == list(range(32))
+
+
+def test_default_metric_uses_sparse_final_layer_capture() -> None:
+    metrics = compute_intrinsic_metrics_from_activations(
+        torch.randn(1, 2, 3),
+        torch.nn.Linear(3, 5, bias=False),
+        full_token_ids=[0, 1, 2],
+        prompt_len=1,
+        layer_indices=[31],
+        num_model_layers=32,
+    )
+
+    assert "self_certainty" in metrics
+    assert not (set(metrics) & {"deep_thinking_ratio", "peak_change_score"})
 
 
 def test_revision_distance_helpers_are_bounded() -> None:
@@ -144,6 +174,7 @@ def test_compute_intrinsic_metrics_from_activations() -> None:
         prompt_len=2,
         jsd_threshold=1.0,
         deep_layer_fraction=0.5,
+        metrics=["all"],
     )
 
     assert set(metrics) == {
@@ -227,6 +258,7 @@ def test_compute_intrinsic_metrics_uses_final_logits_fn_for_targets() -> None:
         lm_head,
         full_token_ids,
         prompt_len=1,
+        metrics=["average_log_probability"],
         final_logits_fn=lambda hidden: lm_head(-hidden),
     )
 
@@ -255,6 +287,7 @@ def test_final_layer_jsd_uses_final_logits_fn_when_available() -> None:
         prompt_len=1,
         jsd_threshold=1e-7,
         deep_layer_fraction=0.75,
+        metrics=["deep_thinking_ratio"],
         final_logits_fn=lambda hidden: lm_head(-hidden),
     )
 
@@ -282,6 +315,11 @@ def test_dtr_uses_running_min_settling_depth() -> None:
         prompt_len=1,
         jsd_threshold=0.01,
         deep_layer_fraction=0.75,
+        metrics=[
+            "average_deep_thinking_settling_depth",
+            "deep_thinking_ratio",
+            "settled_deep_thinking_ratio",
+        ],
     )
 
     assert metrics["deep_layer_start"] == 3.0
@@ -326,6 +364,7 @@ def test_settled_deep_thinking_ratio_is_conditional_on_deep_thinking() -> None:
         prompt_len=1,
         jsd_threshold=1e-6,
         deep_layer_fraction=0.6,
+        metrics=["deep_thinking_ratio", "settled_deep_thinking_ratio"],
         final_logits_fn=lambda hidden: final_logits.expand(hidden.shape[0], -1),
     )
 
@@ -362,6 +401,10 @@ def test_average_deep_thinking_settling_depth() -> None:
         prompt_len=1,
         jsd_threshold=1e-6,
         deep_layer_fraction=0.5,
+        metrics=[
+            "average_deep_thinking_settling_depth",
+            "deep_thinking_ratio",
+        ],
         final_logits_fn=lambda hidden: final_logits.expand(hidden.shape[0], -1),
     )
 
@@ -531,9 +574,29 @@ def test_vectorized_metrics_match_scalar_reference() -> None:
         revision_alpha=0.25,
         revision_middle_layer=1,
         revision_distance="tv",
+        metrics=["all"],
     )
 
     assert actual == pytest.approx(expected, abs=1e-6)
+
+
+def test_final_logits_respect_batch_size() -> None:
+    batch_sizes = []
+    lm_head = torch.nn.Linear(5, 13, bias=False)
+
+    def tracked_lm_head(hidden: torch.Tensor) -> torch.Tensor:
+        batch_sizes.append(hidden.shape[0])
+        return lm_head(hidden)
+
+    compute_intrinsic_metrics_from_activations(
+        torch.randn(3, 7, 5),
+        tracked_lm_head,
+        list(range(1, 9)),
+        prompt_len=1,
+        logits_batch_size=2,
+    )
+
+    assert max(batch_sizes) <= 2
 
 
 def test_response_positions_only_metrics_match_full_stream() -> None:
